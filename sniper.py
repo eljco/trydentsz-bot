@@ -1,11 +1,21 @@
+"""
+CS2 Sniper - 24/7 edition
+- Runs forever in a loop (no GitHub Actions cron gaps), survives errors, backs off on rate limits
+- Scans CSFloat for new listings, compares against Skinport + CSFloat sale history
+- Posts "FLOAT SNIPER"-style embeds to Discord
+"""
+import json
 import os
+import signal
+import statistics
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 
-# ---------------- CONFIG (secrets come from GitHub Actions) ----------------
+# ================= CONFIG =================
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "").strip()
 SEND_TEST_ALERT = os.environ.get("SEND_TEST_ALERT", "false").lower() == "true"
@@ -14,85 +24,261 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
     sys.exit(1)
 
+# --- loop timing ---
+# GitHub Actions mode: RUN_SECONDS > 0 -> poll for that long, then exit (cron starts the next run).
+# Local/VPS mode: RUN_SECONDS = 0 -> run forever.
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))
+BOUNDED = RUN_SECONDS > 0
+POLL_INTERVAL = 8            # seconds between CSFloat polls
+# Max listing age to consider (10 hours). The seen-ids cache prevents repeat alerts.
+MAX_LISTING_AGE = 10 * 60 * 60
+HEARTBEAT_HOURS = 0 if BOUNDED else 6   # only for always-on mode
+FAIL_ALERT_AFTER = 0 if BOUNDED else 10 # only for always-on mode (0 = off)
+
+# --- what to look for ---
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
+MAX_SKIN_PRICE = 35.00       # USD
+MIN_SKIN_PRICE = 0.10
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
+MAX_SP = 4.2                 # sticker crafts: max % of sticker value you pay above base
 
-MAX_SKIN_PRICE = 35.00  # in the currency CSFloat returns (USD); label below says EUR
-
-# Sticker crafts only alert if you pay at most this % of the sticker value (lower = better deal)
-MAX_SP = 4.2
-
-# Charm patterns: only alert on standalone charms (not charms attached to guns)
 ALLOW_CHARMS_ON_GUNS = False
-
-# Gun skin pattern alerts: OFF (you only want charm patterns)
 ENABLE_SKIN_PATTERNS = False
+FAIR_PREMIUM_PCT = 25.0
+FAIR_SLACK = 0.30
 
-# "Fair price" rule for float + gun-pattern alerts. The base price is read live from CSFloat
-# (listing.reference.base_price), nothing is hardcoded. You may pay at most:
-#   base_price * (1 + FAIR_PREMIUM_PCT/100) + FAIR_SLACK
-FAIR_PREMIUM_PCT = 25.0   # % above base price allowed
-FAIR_SLACK = 0.30         # extra flat amount allowed (so 20 cent skins aren't impossible)
+# --- NEW: general "great deal" scanner (like the Five-SeveN example) ---
+ENABLE_DEALS = True
+DEALS_ANY_WEAPON = True      # False = only TARGET_WEAPONS
+DEAL_MIN_DISCOUNT_VS_BASE = 8.0   # % below CSFloat base price (cheap pre-filter)
+DEAL_MIN_DISCOUNT_VS_AVG = 5.0    # % below average of last sales (must pass to alert)
+DEAL_STRONG_VS_AVG = 10.0         # >= this = "STRONG BUY", otherwise "GOOD DEAL"
+DEAL_MIN_SALES = 3                # need at least this many recent sales (liquidity check)
 
-# Set DEBUG_DUMP=true in the workflow to print one listing's raw sticker/price fields
-DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
-_dumped = False
-_sp_warned = False
-_charm_dumped = False
+# --- price comparison sources ---
+ENABLE_SKINPORT = True
+SKINPORT_REFRESH = 330       # seconds (Skinport caches for 5 min, limit 8 req / 5 min)
+# SkinSwap: no verified public endpoint yet - see register_source() at the bottom.
 
-# Charm templates go up to 5 digits
 CHARM_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
     69, 6969, 420, 42069, 4545, 8989, 2323, 12223,
     222, 333, 444, 555, 666, 777, 888, 999, 1337, 404,
 }
+SKIN_PATTERNS = {111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 999, 404}
 
-# Gun pattern seeds (0-1000). Exact matches ONLY - no palindrome/repeater rule for guns,
-# those generic rules are for charm templates (the "#77024" number on charms).
-SKIN_PATTERNS = {
-    111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 999, 404,
-}
+CSFLOAT = "https://csfloat.com/api/v1"
+SEEN_FILE = os.environ.get("SEEN_FILE", "seen_ids.json")
+MAX_SEEN = 5000
 
-POLLS_PER_RUN = 5
-POLL_INTERVAL = 10          # seconds between polls
-MAX_LISTING_AGE = 6 * 60    # only alert on listings newer than 6 min (avoids duplicates across runs)
+# ================= STATE =================
+session = requests.Session()
+SEEN = {}                    # listing_id -> unix time
+HISTORY_CACHE = {}           # name -> (ts, sales)
+PRICE_SOURCES = {}           # source name -> {"fetch": fn, "data": {}, "ts": 0, "every": secs}
+STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0}
+RUNNING = True
 
-SEEN_IDS = set()
+
+def log(*a):
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
 
 
-# ---------------- DISCORD ----------------
-def send_discord_alert(title, skin_name, price, float_val, identifier, details, listing_id=None):
-    fields = [
-        {"name": "💰 Price", "value": f"${price:.2f}", "inline": True},
-        {"name": "✨ Float", "value": f"{float_val}", "inline": True},
-        {"name": "🎯 Match Info", "value": f"`{identifier}`", "inline": True},
-    ]
-    if listing_id:
-        fields.append({"name": "🔗 Listing", "value": f"https://csfloat.com/item/{listing_id}", "inline": False})
+def _stop(*_):
+    global RUNNING
+    RUNNING = False
+    log("Stopping...")
 
-    payload = {
-        "username": "trydentsz cs2 bot 🔥",
-        "embeds": [{
-            "title": f"🚨 {title}",
-            "description": f"**{skin_name}**\n\n📌 **Trigger Details:** {details}",
-            "color": 16711680,
-            "fields": fields,
-            "footer": {"text": "Cloud Sniper • Monster Edition 24/7"},
-        }],
-    }
+
+signal.signal(signal.SIGINT, _stop)
+signal.signal(signal.SIGTERM, _stop)
+
+
+# ================= PERSISTENCE =================
+def load_seen():
     try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        if r.status_code >= 300:
-            print(f"Discord webhook error {r.status_code}: {r.text[:200]}")
+        with open(SEEN_FILE) as f:
+            SEEN.update(json.load(f))
+        log(f"Loaded {len(SEEN)} seen listing ids")
+    except Exception:
+        pass
+
+
+def save_seen():
+    try:
+        if len(SEEN) > MAX_SEEN:
+            for k, _ in sorted(SEEN.items(), key=lambda kv: kv[1])[: len(SEEN) - MAX_SEEN]:
+                SEEN.pop(k, None)
+        with open(SEEN_FILE, "w") as f:
+            json.dump(SEEN, f)
     except Exception as e:
-        print(f"Failed to send webhook: {e}")
+        log("Could not save seen file:", e)
 
 
-# ---------------- CHECKS ----------------
+# ================= DISCORD =================
+def post_discord(payload):
+    for _ in range(4):
+        try:
+            r = session.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        except Exception as e:
+            log("Discord error:", e)
+            time.sleep(2)
+            continue
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 2))
+            except Exception:
+                wait = 2
+            time.sleep(wait + 0.5)
+            continue
+        if r.status_code >= 300:
+            log(f"Discord webhook error {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    return False
+
+
+def money(x):
+    return f"${x:,.2f}" if x is not None else "?"
+
+
+def pct(x):
+    return f"{x:+.1f}%" if x is not None else "?"
+
+
+def fmt_date(iso):
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return "?"
+
+
+def simple_message(text, color=3447003):
+    post_discord({"username": "trydentsz cs2 bot 🔥",
+                  "embeds": [{"description": text, "color": color}]})
+
+
+# ================= PRICE SOURCES =================
+def fetch_skinport():
+    r = session.get(
+        "https://api.skinport.com/v1/items",
+        params={"app_id": 730, "currency": "USD"},
+        headers={"Accept-Encoding": "br, gzip", "User-Agent": "trydentsz-sniper/2.0"},
+        timeout=40,
+    )
+    r.raise_for_status()
+    out = {}
+    for it in r.json():
+        mp = it.get("min_price")
+        if mp:
+            out[it["market_hash_name"]] = {
+                "price": float(mp),
+                "qty": it.get("quantity"),
+                "median": it.get("median_price"),
+                "url": it.get("item_page") or "https://skinport.com",
+            }
+    return out
+
+
+def register_source(name, fetch_fn, every):
+    """
+    Add a marketplace. fetch_fn() must return {market_hash_name: {"price": float, "url": str, "qty": int|None}}
+    Use this to plug in SkinSwap (or any other site) once you have its API details.
+    """
+    PRICE_SOURCES[name] = {"fetch": fetch_fn, "data": {}, "ts": 0, "every": every}
+
+
+def refresh_sources():
+    now = time.time()
+    for name, src in PRICE_SOURCES.items():
+        if now - src["ts"] < src["every"]:
+            continue
+        src["ts"] = now  # set first so failures don't hammer the API
+        try:
+            src["data"] = src["fetch"]()
+            log(f"{name}: loaded {len(src['data'])} prices")
+        except Exception as e:
+            log(f"{name} refresh failed (keeping old data): {e}")
+
+
+def cheapest_elsewhere(name):
+    """Returns list of (source, price, url) for every source that has this item."""
+    res = []
+    for sname, src in PRICE_SOURCES.items():
+        d = src["data"].get(name)
+        if d:
+            res.append((sname, d["price"], d.get("url")))
+    return sorted(res, key=lambda x: x[1])
+
+
+# ================= CSFLOAT HELPERS =================
+def csfloat_get(path, params=None, timeout=15):
+    return session.get(
+        f"{CSFLOAT}{path}",
+        params=params,
+        headers={"Authorization": CSFLOAT_API_KEY,
+                 "User-Agent": "trydentsz-sniper/2.0",
+                 "Accept": "application/json"},
+        timeout=timeout,
+    )
+
+
+def get_sales(name):
+    c = HISTORY_CACHE.get(name)
+    if c and time.time() - c[0] < 600:
+        return c[1]
+    try:
+        r = csfloat_get(f"/history/{quote(name)}/sales")
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        sales = data if isinstance(data, list) else data.get("data", [])
+    except Exception as e:
+        log("sales fetch failed:", e)
+        return []
+    if len(HISTORY_CACHE) > 500:
+        HISTORY_CACHE.clear()
+    HISTORY_CACHE[name] = (time.time(), sales)
+    return sales
+
+
+def summarize_sales(sales):
+    """Last 10 sales without stickers -> averages, stability, last 3."""
+    clean = []
+    for s in sales:
+        item = s.get("item") or {}
+        if item.get("stickers"):
+            continue
+        if not s.get("price"):
+            continue
+        clean.append(s)
+    clean.sort(key=lambda s: s.get("created_at") or "", reverse=True)
+    clean = clean[:10]
+    prices = [s["price"] / 100.0 for s in clean]
+    floats = [(s.get("item") or {}).get("float_value") for s in clean]
+    floats = [f for f in floats if f is not None]
+    if not prices:
+        return None
+    avg = statistics.mean(prices)
+    cv = statistics.pstdev(prices) / avg if len(prices) >= 3 and avg else 0
+    stability = max(0, min(10, round(10 - cv * 40)))
+    return {
+        "n": len(prices),
+        "avg": avg,
+        "avg_float": statistics.mean(floats) if floats else None,
+        "min": min(prices), "max": max(prices),
+        "stability": stability,
+        "last3": [(s["price"] / 100.0, (s.get("item") or {}).get("float_value"), s.get("created_at"))
+                  for s in clean[:3]],
+    }
+
+
+# ================= CHECKS (unchanged logic) =================
 def check_pattern(pattern_num, exact_set, max_value=None, generic=True):
     if pattern_num is None:
         return False
@@ -107,39 +293,37 @@ def check_pattern(pattern_num, exact_set, max_value=None, generic=True):
         return True
     if not generic:
         return False
-    if len(p_str) >= 3 and p_str == p_str[::-1]:  # palindrome
+    if len(p_str) >= 3 and p_str == p_str[::-1]:
         return True
-    if len(p_str) >= 3 and len(set(p_str)) == 1:  # repeaters like 7777
+    if len(p_str) >= 3 and len(set(p_str)) == 1:
         return True
     return False
 
 
-def check_float(float_val):
-    if float_val is None:
+def check_float(v):
+    if v is None:
         return None
-    if 0 < float_val <= 0.0003:
-        return f"Ultra-Low Float ({float_val})"
-    if 0.9995 <= float_val <= 0.99999:
-        return f"Ultra-High Float ({float_val})"
+    if 0 < v <= 0.0003:
+        return f"Ultra-Low Float ({v})"
+    if 0.9995 <= v <= 0.99999:
+        return f"Ultra-High Float ({v})"
     return None
 
 
-def check_stickers(item_data):
-    stickers = item_data.get("stickers") or []
+def check_stickers(item):
     found = []
-    for sticker in stickers:
-        s_name = (sticker.get("name") or "").lower()
-        if any(prem in s_name for prem in PREMIUM_STICKERS):
-            found.append(sticker.get("name"))
+    for st in item.get("stickers") or []:
+        n = (st.get("name") or "").lower()
+        if any(p in n for p in PREMIUM_STICKERS):
+            found.append(st.get("name"))
     return found or None
 
 
-def is_souvenir(name, item_data):
-    return bool(item_data.get("is_souvenir")) or name.startswith("souvenir ")
+def is_souvenir(name, item):
+    return bool(item.get("is_souvenir")) or name.startswith("souvenir ")
 
 
 def get_base_price(listing):
-    """Live base price (in dollars) from CSFloat's own reference data, or None."""
     base = (listing.get("reference") or {}).get("base_price")
     return base / 100.0 if base else None
 
@@ -148,51 +332,36 @@ def fair_price_ok(listing, price):
     base = get_base_price(listing)
     if base is None:
         return False, None
-    allowed = base * (1 + FAIR_PREMIUM_PCT / 100.0) + FAIR_SLACK
-    return price <= allowed, base
+    return price <= base * (1 + FAIR_PREMIUM_PCT / 100.0) + FAIR_SLACK, base
 
 
-def compute_sp(listing, item_data):
-    """
-    Sticker percentage = (price paid above the skin's base price) / (total sticker value) * 100.
-    Matches CSFloat's 'SP' badge. Returns None if it can't be calculated.
-    """
-    # Use a direct value if CSFloat ever exposes one
+def compute_sp(listing, item):
     for key in ("sticker_percentage", "sp"):
-        v = listing.get(key, item_data.get(key))
+        v = listing.get(key, item.get(key))
         if isinstance(v, (int, float)):
             return float(v) * 100 if v <= 1 else float(v)
-
     price = listing.get("price")
     base = (listing.get("reference") or {}).get("base_price")
     if price is None or base is None:
         return None
-
-    sticker_total = 0
-    for s in item_data.get("stickers") or []:
-        ref_price = (s.get("reference") or {}).get("price")
-        if ref_price:
-            sticker_total += ref_price
-    if sticker_total <= 0:
+    total = sum(((s.get("reference") or {}).get("price") or 0) for s in item.get("stickers") or [])
+    if total <= 0:
         return None
+    return max(price - base, 0) / total * 100
 
-    return max(price - base, 0) / sticker_total * 100
 
-
-def is_standalone_charm(name, item_data=None):
+def is_standalone_charm(name, item=None):
     if name.startswith("charm |"):
         return True
-    return bool(item_data) and item_data.get("keychain_pattern") is not None
+    return bool(item) and item.get("keychain_pattern") is not None
 
 
-def get_charm_pattern(item_data):
-    """CSFloat exposes charms as 'keychains'; each has a 'pattern'."""
-    if item_data.get("keychain_pattern") is not None:  # standalone charm items
-        return item_data.get("keychain_pattern")
-    for k in item_data.get("keychains") or []:
-        p = k.get("pattern")
-        if p is not None:
-            return p
+def get_charm_pattern(item):
+    if item.get("keychain_pattern") is not None:
+        return item.get("keychain_pattern")
+    for k in item.get("keychains") or []:
+        if k.get("pattern") is not None:
+            return k.get("pattern")
     return None
 
 
@@ -202,161 +371,292 @@ def is_fresh(listing):
         return True
     try:
         dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-        age = (datetime.now(timezone.utc) - dt).total_seconds()
-        return age <= MAX_LISTING_AGE
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= MAX_LISTING_AGE
     except Exception:
         return True
 
 
-# ---------------- POLL ----------------
-def poll_csfloat_api(listing_type="buy_now"):
-    """Returns True if the API call succeeded, False otherwise."""
-    url = "https://csfloat.com/api/v1/listings"
-    params = {"limit": 50, "sort_by": "most_recent", "type": listing_type}
-    headers = {
-        "Authorization": CSFLOAT_API_KEY,  # raw key, no "Bearer"
-        "User-Agent": "trydentsz-sniper/1.0",
-        "Accept": "application/json",
+# ================= EMBED =================
+def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
+    name = item.get("market_hash_name") or "Unknown"
+    float_val = item.get("float_value")
+    seed = item.get("paint_seed")
+    lid = listing.get("id")
+    base = get_base_price(listing)
+    sales = summarize_sales(get_sales(name))
+    others = cheapest_elsewhere(name)
+
+    discount = ((price - base) / base * 100) if base else None
+    vs_avg = ((price - sales["avg"]) / sales["avg"] * 100) if sales else None
+
+    seller = listing.get("seller") or {}
+    stats = seller.get("statistics") or {}
+    seller_txt = seller.get("username") or "?"
+    if stats.get("total_trades") is not None:
+        seller_txt += f" ({stats['total_trades']} trades)"
+
+    # float quality line
+    float_q = ""
+    if sales and sales["avg_float"] and float_val is not None:
+        r = float_val / sales["avg_float"] if sales["avg_float"] else 1
+        float_q = "🟢 Float Excellent" if r < 0.75 else ("🟡 Float Average" if r < 1.25 else "🔴 Float High")
+
+    head = verdict or "📌 ALERT"
+    desc = [f"**{head}**"]
+    line2 = []
+    if base and price < base:
+        line2.append(f"Save {money(base - price)}")
+    if float_q:
+        line2.append(float_q)
+    if line2:
+        desc.append(" · ".join(line2))
+    desc.append(f"\n📌 **Trigger:** {trigger_text}")
+
+    fields = [
+        {"name": "💰 Listing price", "value": money(price), "inline": True},
+        {"name": "📊 Market price", "value": money(base), "inline": True},
+        {"name": "📉 Discount", "value": pct(discount), "inline": True},
+        {"name": "🎲 Float", "value": f"`{float_val:.6f}`" if float_val is not None else "?", "inline": True},
+        {"name": "🌱 Seed", "value": f"`{seed}`" if seed is not None else "?", "inline": True},
+        {"name": "👤 Seller", "value": seller_txt, "inline": True},
+    ]
+    if sales:
+        fields += [
+            {"name": f"📈 Avg {sales['n']} sales", "value": money(sales["avg"]), "inline": True},
+            {"name": "🎲 Avg float",
+             "value": f"`{sales['avg_float']:.6f}`" if sales["avg_float"] else "?", "inline": True},
+            {"name": "📊 vs Avg", "value": pct(vs_avg), "inline": True},
+        ]
+        label = "🟢 Stable" if sales["stability"] >= 8 else ("🟡 Moderate" if sales["stability"] >= 5 else "🔴 Volatile")
+        fields.append({"name": "📊 Stability",
+                       "value": f"{label} {sales['stability']}/10\n"
+                                f"Range {money(sales['min'])} – {money(sales['max'])} · {sales['n']} sales",
+                       "inline": False})
+
+    # price comparison across other sites
+    if others:
+        lines = []
+        for sname, p, url in others:
+            diff = (price - p) / p * 100
+            tag = "✅ listing is cheaper" if price <= p else "⚠️ cheaper here"
+            link = f"[{sname}]({url})" if url else sname
+            lines.append(f"{link}: **{money(p)}** ({diff:+.1f}% vs listing) {tag}")
+        lines.append("_Other sites show lowest price for the skin, not float-matched._")
+        fields.append({"name": "🏪 Price comparison", "value": "\n".join(lines)[:1000], "inline": False})
+        if price <= others[0][1]:
+            fields.append({"name": "✅ Best price", "value": "Cheapest vs all tracked sites.", "inline": False})
+    else:
+        fields.append({"name": "🏪 Price comparison", "value": "No other-site price found.", "inline": False})
+
+    if sales and sales["last3"]:
+        rows = []
+        for i, (sp_, sf, sd) in enumerate(sales["last3"], 1):
+            rel = (sp_ - price) / price * 100 if price else 0
+            fl = f"`{sf:.6f}`" if sf is not None else "?"
+            rows.append(f"**#{i}** {money(sp_)} · {fl} → {rel:+.0f}% vs listing · {fmt_date(sd)}")
+        fields.append({"name": f"🕐 Last {len(rows)} sales (w/o stickers)", "value": "\n".join(rows), "inline": False})
+
+    if lid:
+        fields.append({"name": "🛒 BUY NOW", "value": f"[Open on CSFloat](https://csfloat.com/item/{lid})",
+                       "inline": False})
+
+    embed = {
+        "title": f"🚨 {title} — {name}",
+        "url": f"https://csfloat.com/item/{lid}" if lid else None,
+        "description": "\n".join(desc),
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"Cloud Sniper • 24/7 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
     }
+    icon = item.get("icon_url")
+    if icon:
+        embed["thumbnail"] = {"url": f"https://community.cloudflare.steamstatic.com/economy/image/{icon}/360fx360f"}
+    return {"username": "trydentsz cs2 bot 🔥", "embeds": [embed]}
 
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-    except Exception as e:
-        print(f"Request exception: {e}")
-        return False
 
-    print(f"API Response Status ({listing_type}): {response.status_code}")
-    if response.status_code != 200:
-        body = response.text[:300].replace("\n", " ")
-        print(f"API Error Body: {body}")
-        if "cloudflare" in response.text.lower() or "just a moment" in response.text.lower():
-            print("-> Looks like a Cloudflare block of GitHub's IP range, not an auth problem.")
-        return False
+# ================= LISTING EVALUATION =================
+def evaluate(listing):
+    """Returns (title, trigger_text, color, verdict) or None."""
+    item = listing.get("item") or {}
+    name_orig = item.get("market_hash_name") or ""
+    name = name_orig.lower()
+    price = (listing.get("price") or 0) / 100.0
+    if price <= 0:
+        return None
+    float_val = item.get("float_value")
+    skin_pattern = item.get("paint_seed")
+    charm_item = is_standalone_charm(name, item)
+    charm_pattern = get_charm_pattern(item)
+    is_target = any(w in name for w in TARGET_WEAPONS) or charm_item
 
-    try:
-        data = response.json()
-    except Exception:
-        print("Response was not valid JSON.")
-        return False
+    # 1. rare charm pattern
+    if is_target and (charm_item or ALLOW_CHARMS_ON_GUNS) and charm_pattern is not None \
+            and check_pattern(charm_pattern, CHARM_PATTERNS):
+        return ("RARE CHARM PATTERN", f"Matched charm pattern: {charm_pattern}", 16711680, "💎 RARE CHARM")
 
-    listings = data if isinstance(data, list) else data.get("data", [])
+    # 2. premium sticker craft
+    if is_target and not is_souvenir(name, item) and price <= MAX_SKIN_PRICE:
+        matched = check_stickers(item)
+        if matched:
+            sp = compute_sp(listing, item)
+            if sp is not None and sp <= MAX_SP:
+                return ("PREMIUM STICKER CRAFT", f"{sp:.1f}% SP | Stickers: {', '.join(matched)}",
+                        16711680, "🏷️ STICKER CRAFT")
 
-    global _dumped
-    if DEBUG_DUMP and not _dumped:
-        for l in listings:
-            if (l.get("item") or {}).get("stickers"):
-                import json
-                it = l["item"]
-                print("DEBUG price:", l.get("price"), "reference:", l.get("reference"))
-                print("DEBUG stickers:", json.dumps(it.get("stickers"))[:600])
-                print("DEBUG item keys:", list(it.keys()))
-                _dumped = True
-                break
+    # 3. rare gun pattern
+    if (is_target and ENABLE_SKIN_PATTERNS and not charm_item and price <= MAX_SKIN_PRICE
+            and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000, generic=False)):
+        ok, base = fair_price_ok(listing, price)
+        if ok:
+            return ("RARE SKIN PATTERN", f"Pattern {skin_pattern} at fair price (base ${base:.2f})",
+                    16711680, "🌱 RARE PATTERN")
 
-    global _charm_dumped
-    if DEBUG_DUMP and not _charm_dumped:
-        for l in listings:
-            it = l.get("item") or {}
-            if (it.get("market_hash_name") or "").lower().startswith("charm |"):
-                import json
-                print("DEBUG charm item:", json.dumps(it)[:700])
-                _charm_dumped = True
-                break
-
-    for listing in listings:
-        listing_id = listing.get("id")
-        if listing_id in SEEN_IDS or not is_fresh(listing):
-            continue
-
-        item_data = listing.get("item", {}) or {}
-        name = (item_data.get("market_hash_name") or "").lower()
-        charm_pattern = get_charm_pattern(item_data)
-
-        charm_item = is_standalone_charm(name, item_data)
-
-        is_target = any(w in name for w in TARGET_WEAPONS) or charm_item
-        if not is_target:
-            continue
-
-        price = (listing.get("price") or 0) / 100.0
-        float_val = item_data.get("float_value")
-        skin_pattern = item_data.get("paint_seed")  # pattern template (paint_index is the skin ID)
-
-        alerted = False
-
-        # 1. Rare charm pattern (no price cap)
-        charm_ok = charm_item or ALLOW_CHARMS_ON_GUNS
-        if charm_ok and charm_pattern is not None and check_pattern(charm_pattern, CHARM_PATTERNS):
-            send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val,
-                               charm_pattern, f"Matched charm pattern: {charm_pattern}", listing_id)
-            alerted = True
-
-        # 2. Premium sticker crafts (price cap AND SP cap)
-        if not alerted:
-            # Souvenir stickers are not crafts (and inflate sticker value), so skip souvenirs
-            matched = None if is_souvenir(name, item_data) else check_stickers(item_data)
-            if matched and price <= MAX_SKIN_PRICE:
-                sp = compute_sp(listing, item_data)
-                if sp is None:
-                    global _sp_warned
-                    if not _sp_warned:
-                        print("Could not compute SP for a sticker listing - skipping those. "
-                              "Run with DEBUG_DUMP=true and send me the output.")
-                        _sp_warned = True
-                elif sp <= MAX_SP:
-                    s = ", ".join(matched)
-                    send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val,
-                                       f"{sp:.1f}% SP", f"{sp:.1f}% SP | Stickers: {s}", listing_id)
-                    alerted = True
-
-        # 3. Rare gun pattern (fair price vs live base price only)
-        if (not alerted and ENABLE_SKIN_PATTERNS and not charm_item
-                and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000, generic=False)
-                and price <= MAX_SKIN_PRICE):
+    # 4. extreme float
+    if is_target and not charm_item and price <= MAX_SKIN_PRICE:
+        msg = check_float(float_val)
+        if msg:
             ok, base = fair_price_ok(listing, price)
             if ok:
-                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val,
-                                   skin_pattern,
-                                   f"Pattern {skin_pattern} at fair price (base ${base:.2f})", listing_id)
-                alerted = True
+                return ("EXTREME FLOAT", f"{msg} | paying ${price:.2f} vs base ${base:.2f}",
+                        16711680, "🎯 EXTREME FLOAT")
 
-        # 4. Extreme float (fair price vs live base price only)
-        if not alerted and not charm_item:
-            float_msg = check_float(float_val)
-            if float_msg and price <= MAX_SKIN_PRICE:
-                ok, base = fair_price_ok(listing, price)
-                if ok:
-                    send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val,
-                                       skin_pattern if skin_pattern is not None else "N/A",
-                                       f"{float_msg} | paying ${price:.2f} vs base ${base:.2f}", listing_id)
-                    alerted = True
+    # 5. great deal vs market (works on any skin if DEALS_ANY_WEAPON)
+    if ENABLE_DEALS and not charm_item and MIN_SKIN_PRICE <= price <= MAX_SKIN_PRICE \
+            and (DEALS_ANY_WEAPON or is_target) and not item.get("stickers"):
+        base = get_base_price(listing)
+        if base and (base - price) / base * 100 >= DEAL_MIN_DISCOUNT_VS_BASE:
+            s = summarize_sales(get_sales(name_orig))
+            if s and s["n"] >= DEAL_MIN_SALES:
+                below_avg = (s["avg"] - price) / s["avg"] * 100
+                if below_avg >= DEAL_MIN_DISCOUNT_VS_AVG:
+                    strong = below_avg >= DEAL_STRONG_VS_AVG
+                    return ("GREAT DEAL",
+                            f"{below_avg:.0f}% below avg sale price, {(base - price) / base * 100:.0f}% below market",
+                            16766720 if not strong else 5763719,
+                            "⭐ STRONG BUY" if strong else "👍 GOOD DEAL")
+    return None
 
-        if alerted and listing_id:
-            SEEN_IDS.add(listing_id)
 
-    return True
+# ================= POLL =================
+def poll_once():
+    """Returns (ok, sleep_override)."""
+    try:
+        r = csfloat_get("/listings", params={"limit": 50, "sort_by": "most_recent", "type": "buy_now"})
+    except Exception as e:
+        log("Request exception:", e)
+        return False, 15
+
+    if r.status_code == 429:
+        wait = float(r.headers.get("Retry-After", 60))
+        log(f"Rate limited, sleeping {wait:.0f}s")
+        return False, wait
+    if r.status_code != 200:
+        body = r.text[:200].replace("\n", " ")
+        log(f"API error {r.status_code}: {body}")
+        if "just a moment" in r.text.lower() or "cloudflare" in r.text.lower():
+            return False, 120
+        return False, 30
+    try:
+        data = r.json()
+    except Exception:
+        log("Bad JSON from CSFloat")
+        return False, 15
+
+    listings = data if isinstance(data, list) else data.get("data", [])
+    now = time.time()
+    new_seen = False
+    for listing in listings:
+        lid = listing.get("id")
+        if not lid or lid in SEEN:
+            continue
+        SEEN[lid] = now
+        new_seen = True
+        if not is_fresh(listing):
+            continue
+        STATS["listings"] += 1
+        try:
+            hit = evaluate(listing)
+            if hit:
+                title, trig, color, verdict = hit
+                item = listing.get("item") or {}
+                price = (listing.get("price") or 0) / 100.0
+                payload = build_embed(title, listing, item, price, trig, color, verdict)
+                if post_discord(payload):
+                    STATS["alerts"] += 1
+                    log(f"ALERT: {title} {item.get('market_hash_name')} ${price:.2f}")
+        except Exception as e:
+            log("Error evaluating listing:", repr(e))
+    if new_seen:
+        save_seen()
+    return True, None
+
+
+# ================= MAIN LOOP =================
+def main():
+    log("🚀 Cloud Sniper 24/7 starting")
+    load_seen()
+    if ENABLE_SKINPORT:
+        register_source("Skinport", fetch_skinport, SKINPORT_REFRESH)
+
+    if SEND_TEST_ALERT:
+        simple_message("✅ **TEST ALERT:** sniper is alive and posting to Discord.", 5763719)
+
+    fails = 0
+    warned = False
+    successes = 0
+    last_beat = time.time()
+    deadline = time.time() + RUN_SECONDS if BOUNDED else None
+
+    while RUNNING:
+        if deadline and time.time() >= deadline:
+            break
+        loop_start = time.time()
+        try:
+            refresh_sources()
+            ok, override = poll_once()
+        except Exception as e:  # nothing should ever kill the loop
+            log("Unexpected error:", repr(e))
+            ok, override = False, 20
+
+        STATS["polls"] += 1
+        if ok:
+            successes += 1
+            if warned:
+                simple_message("✅ Bot recovered, polling normally again.", 5763719)
+                warned = False
+            fails = 0
+        else:
+            fails += 1
+            STATS["errors"] += 1
+            if FAIL_ALERT_AFTER and fails >= FAIL_ALERT_AFTER and not warned:
+                simple_message(f"⚠️ {fails} polls in a row failed (rate limit / block / API down). "
+                               f"Still retrying with backoff.", 15158332)
+                warned = True
+
+        if HEARTBEAT_HOURS and time.time() - last_beat >= HEARTBEAT_HOURS * 3600:
+            simple_message(f"💓 Alive — {STATS['polls']} polls, {STATS['listings']} new listings checked, "
+                           f"{STATS['alerts']} alerts, {STATS['errors']} errors.")
+            last_beat = time.time()
+
+        # sleep: normal interval, or exponential backoff while failing
+        if override:
+            delay = override
+        elif not ok:
+            delay = min(300, POLL_INTERVAL * (2 ** min(fails, 5)))
+        else:
+            delay = max(1, POLL_INTERVAL - (time.time() - loop_start))
+        end = time.time() + delay
+        if deadline:
+            end = min(end, deadline)
+        while RUNNING and time.time() < end:
+            time.sleep(min(1, end - time.time()))
+
+    save_seen()
+    log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['alerts']} alerts.")
+    # red job if every poll failed, so blocks/403s aren't hidden behind a green check
+    if BOUNDED and successes == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    print("🚀 Cloud Sniper Bot (Authenticated Monster Edition) starting poll loop...")
-
-    successes = 0
-    for i in range(POLLS_PER_RUN):
-        if poll_csfloat_api("buy_now"):  # buy-now listings only, no auctions
-            successes += 1
-        if i < POLLS_PER_RUN - 1:
-            time.sleep(POLL_INTERVAL)
-
-    if SEND_TEST_ALERT:
-        print("🚀 Sending manual test alert...")
-        send_discord_alert(
-            "TEST ALERT: SNIPER IS ALIVE!",
-            "AK-47 | Frontside Misty (Field-Tested)",
-            14.72, 0.191136, "414",
-            "Manual test trigger - checking Discord connection!",
-        )
-
-    # Make the job go red if every poll failed, so 403s aren't hidden behind a green check
-    if successes == 0:
-        print("All polls failed.")
-        sys.exit(1)
+    main()
