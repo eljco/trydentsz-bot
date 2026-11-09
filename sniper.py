@@ -29,8 +29,8 @@ MAX_SP = 4.2
 # Charm patterns: only alert on standalone charms (not charms attached to guns)
 ALLOW_CHARMS_ON_GUNS = False
 
-# Gun skin pattern alerts (own pattern list, guns only have seeds 0-1000)
-ENABLE_SKIN_PATTERNS = True
+# Gun skin pattern alerts: OFF (you only want charm patterns)
+ENABLE_SKIN_PATTERNS = False
 
 # "Fair price" rule for float + gun-pattern alerts. The base price is read live from CSFloat
 # (listing.reference.base_price), nothing is hardcoded. You may pay at most:
@@ -42,6 +42,7 @@ FAIR_SLACK = 0.30         # extra flat amount allowed (so 20 cent skins aren't i
 DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
 _dumped = False
 _sp_warned = False
+_charm_dumped = False
 
 # Charm templates go up to 5 digits
 CHARM_PATTERNS = {
@@ -50,7 +51,8 @@ CHARM_PATTERNS = {
     222, 333, 444, 555, 666, 777, 888, 999, 1337, 404,
 }
 
-# Gun pattern seeds only go 0-1000, so only values in that range belong here
+# Gun pattern seeds (0-1000). Exact matches ONLY - no palindrome/repeater rule for guns,
+# those generic rules are for charm templates (the "#77024" number on charms).
 SKIN_PATTERNS = {
     111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 999, 404,
 }
@@ -91,7 +93,7 @@ def send_discord_alert(title, skin_name, price, float_val, identifier, details, 
 
 
 # ---------------- CHECKS ----------------
-def check_pattern(pattern_num, exact_set, max_value=None):
+def check_pattern(pattern_num, exact_set, max_value=None, generic=True):
     if pattern_num is None:
         return False
     try:
@@ -103,6 +105,8 @@ def check_pattern(pattern_num, exact_set, max_value=None):
     p_str = str(n)
     if n in exact_set:
         return True
+    if not generic:
+        return False
     if len(p_str) >= 3 and p_str == p_str[::-1]:  # palindrome
         return True
     if len(p_str) >= 3 and len(set(p_str)) == 1:  # repeaters like 7777
@@ -175,8 +179,10 @@ def compute_sp(listing, item_data):
     return max(price - base, 0) / sticker_total * 100
 
 
-def is_standalone_charm(name):
-    return name.startswith("charm |")
+def is_standalone_charm(name, item_data=None):
+    if name.startswith("charm |"):
+        return True
+    return bool(item_data) and item_data.get("keychain_pattern") is not None
 
 
 def get_charm_pattern(item_data):
@@ -203,10 +209,10 @@ def is_fresh(listing):
 
 
 # ---------------- POLL ----------------
-def poll_csfloat_api():
+def poll_csfloat_api(listing_type="buy_now"):
     """Returns True if the API call succeeded, False otherwise."""
     url = "https://csfloat.com/api/v1/listings"
-    params = {"limit": 50, "sort_by": "most_recent", "type": "buy_now"}
+    params = {"limit": 50, "sort_by": "most_recent", "type": listing_type}
     headers = {
         "Authorization": CSFLOAT_API_KEY,  # raw key, no "Bearer"
         "User-Agent": "trydentsz-sniper/1.0",
@@ -219,7 +225,7 @@ def poll_csfloat_api():
         print(f"Request exception: {e}")
         return False
 
-    print(f"API Response Status: {response.status_code}")
+    print(f"API Response Status ({listing_type}): {response.status_code}")
     if response.status_code != 200:
         body = response.text[:300].replace("\n", " ")
         print(f"API Error Body: {body}")
@@ -247,6 +253,16 @@ def poll_csfloat_api():
                 _dumped = True
                 break
 
+    global _charm_dumped
+    if DEBUG_DUMP and not _charm_dumped:
+        for l in listings:
+            it = l.get("item") or {}
+            if (it.get("market_hash_name") or "").lower().startswith("charm |"):
+                import json
+                print("DEBUG charm item:", json.dumps(it)[:700])
+                _charm_dumped = True
+                break
+
     for listing in listings:
         listing_id = listing.get("id")
         if listing_id in SEEN_IDS or not is_fresh(listing):
@@ -256,7 +272,9 @@ def poll_csfloat_api():
         name = (item_data.get("market_hash_name") or "").lower()
         charm_pattern = get_charm_pattern(item_data)
 
-        is_target = any(w in name for w in TARGET_WEAPONS) or is_standalone_charm(name)
+        charm_item = is_standalone_charm(name, item_data)
+
+        is_target = any(w in name for w in TARGET_WEAPONS) or charm_item
         if not is_target:
             continue
 
@@ -267,7 +285,7 @@ def poll_csfloat_api():
         alerted = False
 
         # 1. Rare charm pattern (no price cap)
-        charm_ok = is_standalone_charm(name) or ALLOW_CHARMS_ON_GUNS
+        charm_ok = charm_item or ALLOW_CHARMS_ON_GUNS
         if charm_ok and charm_pattern is not None and check_pattern(charm_pattern, CHARM_PATTERNS):
             send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val,
                                charm_pattern, f"Matched charm pattern: {charm_pattern}", listing_id)
@@ -292,8 +310,8 @@ def poll_csfloat_api():
                     alerted = True
 
         # 3. Rare gun pattern (fair price vs live base price only)
-        if (not alerted and ENABLE_SKIN_PATTERNS and not is_standalone_charm(name)
-                and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000)
+        if (not alerted and ENABLE_SKIN_PATTERNS and not charm_item
+                and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000, generic=False)
                 and price <= MAX_SKIN_PRICE):
             ok, base = fair_price_ok(listing, price)
             if ok:
@@ -303,7 +321,7 @@ def poll_csfloat_api():
                 alerted = True
 
         # 4. Extreme float (fair price vs live base price only)
-        if not alerted and not is_standalone_charm(name):
+        if not alerted and not charm_item:
             float_msg = check_float(float_val)
             if float_msg and price <= MAX_SKIN_PRICE:
                 ok, base = fair_price_ok(listing, price)
@@ -324,7 +342,7 @@ if __name__ == "__main__":
 
     successes = 0
     for i in range(POLLS_PER_RUN):
-        if poll_csfloat_api():
+        if poll_csfloat_api("buy_now"):  # buy-now listings only, no auctions
             successes += 1
         if i < POLLS_PER_RUN - 1:
             time.sleep(POLL_INTERVAL)
