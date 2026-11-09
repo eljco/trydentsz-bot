@@ -20,6 +20,14 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "").strip()
 SEND_TEST_ALERT = os.environ.get("SEND_TEST_ALERT", "false").lower() == "true"
 
+# Optional per-channel webhooks. If one isn't set, alerts for it fall back to the main webhook.
+WEBHOOKS = {
+    "main": DISCORD_WEBHOOK,
+    "cheap": os.environ.get("DISCORD_WEBHOOK_CHEAP", "").strip() or DISCORD_WEBHOOK,
+    "knives": os.environ.get("DISCORD_WEBHOOK_KNIVES", "").strip() or DISCORD_WEBHOOK,
+    "gloves": os.environ.get("DISCORD_WEBHOOK_GLOVES", "").strip() or DISCORD_WEBHOOK,
+}
+
 if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
     sys.exit(1)
@@ -67,6 +75,15 @@ STRONG_MIN_PCT = 8.0              # %  and stability >= STRONG_MIN_STABILITY
 STRONG_MIN_STABILITY = 5
 GOOD_MIN_PROFIT = 0.30
 GOOD_MIN_PCT = 4.0
+# Knives & gloves (posted to their own channels). Judged on % and $ net profit after fees.
+MAX_KNIFE_PRICE = 259.00      # ~225 EUR (at ~1.15 USD per EUR)
+MAX_GLOVE_PRICE = 259.00      # ~225 EUR
+PREMIUM_MIN_SALES = 3
+PREMIUM_STRONG_PROFIT = 8.00      # $ net  (and STRONG_MIN_PCT, stability >= STRONG_MIN_STABILITY)
+PREMIUM_GOOD_PROFIT = 3.00        # $ net  (and GOOD_MIN_PCT)
+# Finishes where price depends on the pattern/phase, so name-based averages are unreliable -> skipped
+PATTERN_DEPENDENT = ["doppler", "marble fade", "fade", "case hardened", "crimson web", "slaughter", "blue gem"]
+
 # Cheap items (under ~1 EUR): a flat 7 cent net profit is enough to count as a nice deal
 CHEAP_MAX_PRICE = 1.15            # USD, roughly 1 EUR - adjust if the exchange rate moves
 CHEAP_MIN_PROFIT = 0.07           # $ net after fees
@@ -135,10 +152,11 @@ def save_seen():
 
 
 # ================= DISCORD =================
-def post_discord(payload):
+def post_discord(payload, webhook=None):
+    webhook = webhook or DISCORD_WEBHOOK
     for _ in range(4):
         try:
-            r = session.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            r = session.post(webhook, json=payload, timeout=10)
         except Exception as e:
             log("Discord error:", e)
             time.sleep(2)
@@ -173,9 +191,9 @@ def fmt_date(iso):
         return "?"
 
 
-def simple_message(text, color=3447003):
+def simple_message(text, color=3447003, webhook=None):
     post_discord({"username": "trydentsz cs2 bot 🔥",
-                  "embeds": [{"description": text, "color": color}]})
+                  "embeds": [{"description": text, "color": color}]}, webhook)
 
 
 # ================= PRICE SOURCES =================
@@ -381,6 +399,15 @@ def get_charm_pattern(item):
     return None
 
 
+def item_category(name_orig):
+    n = (name_orig or "").lower()
+    if "gloves" in n or "hand wraps" in n:
+        return "gloves"
+    if n.startswith("★"):
+        return "knives"
+    return "gun"
+
+
 def is_fresh(listing):
     created = listing.get("created_at")
     if not created:
@@ -537,30 +564,43 @@ def evaluate(listing):
                         16711680, "🎯 EXTREME FLOAT")
 
     # 5. deal vs market, judged on profit AFTER fees, with volatility filter
-    if ENABLE_DEALS and not charm_item and MIN_SKIN_PRICE <= price <= MAX_SKIN_PRICE \
-            and (DEALS_ANY_WEAPON or is_target) and not item.get("stickers"):
+    cat = item_category(name_orig)
+    premium = cat in ("knives", "gloves")
+    max_price = {"knives": MAX_KNIFE_PRICE, "gloves": MAX_GLOVE_PRICE}.get(cat, MAX_SKIN_PRICE)
+    if ENABLE_DEALS and not charm_item and MIN_SKIN_PRICE <= price <= max_price \
+            and (DEALS_ANY_WEAPON or is_target or premium) and not item.get("stickers"):
+        if premium and any(k in name for k in PATTERN_DEPENDENT):
+            return None
         base = get_base_price(listing)
         if base and (base - price) / base * 100 >= DEAL_MIN_DISCOUNT_VS_BASE:
             s = summarize_sales(get_sales(name_orig))
-            if s and s["n"] >= DEAL_MIN_SALES and s["stability"] >= MIN_STABILITY:
+            min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
+            if s and s["n"] >= min_sales and s["stability"] >= MIN_STABILITY:
                 # conservative resale estimate: lower of average / median / market price
                 resale = min(s["avg"], s["median"], base)
                 net = resale * (1 - SELL_FEE) - price
                 net_pct = net / price * 100
                 trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
                         f"| resale est. {money(resale)} | {(base - price) / base * 100:.0f}% below market")
+                if premium:
+                    if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
+                            and s["stability"] >= STRONG_MIN_STABILITY:
+                        return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", cat)
+                    if net >= PREMIUM_GOOD_PROFIT and net_pct >= GOOD_MIN_PCT:
+                        return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", cat)
+                    return None
                 if price <= CHEAP_MAX_PRICE:
                     # cheap items: only alert on >= 7c net profit, nothing weaker
                     if net >= CHEAP_MIN_PROFIT:
-                        return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)")
+                        return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
                     return None
                 if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT \
                         and s["stability"] >= STRONG_MIN_STABILITY:
-                    return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY")
+                    return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", "main")
                 if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
-                    return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL")
+                    return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
                 if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
-                    return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT")
+                    return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT", "main")
     return None
 
 
@@ -604,13 +644,14 @@ def poll_once():
         try:
             hit = evaluate(listing)
             if hit:
-                title, trig, color, verdict = hit
+                title, trig, color, verdict = hit[:4]
+                channel = hit[4] if len(hit) > 4 else "main"
                 item = listing.get("item") or {}
                 price = (listing.get("price") or 0) / 100.0
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
-                if post_discord(payload):
+                if post_discord(payload, WEBHOOKS.get(channel)):
                     STATS["alerts"] += 1
-                    log(f"ALERT: {title} {item.get('market_hash_name')} ${price:.2f}")
+                    log(f"ALERT[{channel}]: {title} {item.get('market_hash_name')} ${price:.2f}")
         except Exception as e:
             log("Error evaluating listing:", repr(e))
     if new_seen:
@@ -626,7 +667,8 @@ def main():
         register_source("Skinport", fetch_skinport, SKINPORT_REFRESH)
 
     if SEND_TEST_ALERT:
-        simple_message("✅ **TEST ALERT:** sniper is alive and posting to Discord.", 5763719)
+        for ch, hook in WEBHOOKS.items():
+            simple_message(f"✅ **TEST ALERT:** sniper is alive — this is the **{ch}** channel.", 5763719, hook)
 
     fails = 0
     warned = False
