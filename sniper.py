@@ -5,6 +5,9 @@ import os
 # Your Discord Webhook URL
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1569335516392988756/DCKSmOW9pS6rb7ncwC3eL56q_BcKAFjMfjx1atcxf5T2_GUG7lelOmEq2MPpLxfsHV9g"
 
+# Your CSFloat API Key
+CSFLOAT_API_KEY = "XjjpTSVvh3REtzNEeyU0SY7H9gz9aMUd"
+
 # Target Weapons
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
 
@@ -15,7 +18,7 @@ PREMIUM_STICKERS = [
 ]
 
 # Max price limit for gun skins/sticker crafts (Euro)
-MAX_SKIN_PRICE = 40.00
+MAX_SKIN_PRICE = 35.00
 
 # Exact Patterns & Charms
 EXACT_PATTERNS = {
@@ -81,20 +84,22 @@ def check_stickers(item_data):
     return found_stickers if found_stickers else None
 
 def poll_csfloat_api():
-    """Scans CSFloat public listings API with bulletproof browser headers"""
+    """Scans CSFloat public listings API using your authenticated API key"""
     url = "https://csfloat.com/api/v1/listings?limit=25"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://csfloat.com/",
-        "Origin": "https://csfloat.com/"
+        "Origin": "https://csfloat.com/",
+        "Authorization": CSFLOAT_API_KEY
     }
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
+        print(f"API Response Status: {response.status_code}")
         if response.status_code != 200:
-            print(f"API Error: {response.status_code}")
+            print(f"API Error Details: {response.text}")
             return
         
         listings = response.json()
@@ -122,29 +127,29 @@ def poll_csfloat_api():
                 send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val, charm_pattern, f"Matched charm pattern ID: {charm_pattern}")
                 continue
 
-            # 2. Check Premium Sticker Crafts (Enforcing <= €40 price limit)
+            # 2. Check Premium Sticker Crafts (Enforcing <= €35 price limit)
             matched_stickers = check_stickers(item_data)
             if matched_stickers and price <= MAX_SKIN_PRICE:
                 sticker_list_str = ", ".join(matched_stickers)
-                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val, sticker_list_str, f"Found high-tier stickers under €40 limit! Stickers: {sticker_list_str}")
+                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val, sticker_list_str, f"Found high-tier stickers under €35 limit! Stickers: {sticker_list_str}")
                 continue
 
-            # 3. Check Gun Skin Patterns (Enforcing <= €40 price limit)
+            # 3. Check Gun Skin Patterns (Enforcing <= €35 price limit)
             if skin_pattern and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE:
-                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched pattern template under €40: {skin_pattern}")
+                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched pattern template under €35: {skin_pattern}")
                 continue
 
-            # 4. Check Float Extremes (Enforcing <= €40 price limit)
+            # 4. Check Float Extremes (Enforcing <= €35 price limit)
             float_msg = check_float(float_val)
             if float_msg and price <= MAX_SKIN_PRICE:
-                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", f"{float_msg} under €40 limit")
+                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", f"{float_msg} under €35 limit")
                 continue
 
     except Exception as e:
         print(f"Polling exception: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Cloud Sniper Bot (Monster Edition) starting poll loop...")
+    print("🚀 Cloud Sniper Bot (Authenticated Monster Edition) starting poll loop...")
     for _ in range(5):
         poll_csfloat_api()
         time.sleep(10)
