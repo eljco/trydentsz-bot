@@ -142,3 +142,14 @@ if __name__ == "__main__":
     for _ in range(5):
         poll_csfloat_api()
         time.sleep(10)
+if __name__ == "__main__":
+    print("🚀 Forcing manual test alert...")
+    # Send a fake test notification right now to verify Discord webhook
+    send_discord_alert(
+        "TEST ALERT: SNIPER IS ALIVE!", 
+        "AK-47 | Frontside Misty (Field-Tested)", 
+        14.72, 
+        0.191136, 
+        "414", 
+        "Manual test trigger - checking Discord connection!"
+    )
