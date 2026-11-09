@@ -26,6 +26,7 @@ WEBHOOKS = {
     "cheap": os.environ.get("DISCORD_WEBHOOK_CHEAP", "").strip() or DISCORD_WEBHOOK,
     "knives": os.environ.get("DISCORD_WEBHOOK_KNIVES", "").strip() or DISCORD_WEBHOOK,
     "gloves": os.environ.get("DISCORD_WEBHOOK_GLOVES", "").strip() or DISCORD_WEBHOOK,
+    "ouncetra": os.environ.get("DISCORD_WEBHOOK_OUNCETRA", "").strip() or DISCORD_WEBHOOK,
 }
 
 if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
@@ -83,6 +84,16 @@ PREMIUM_STRONG_PROFIT = 8.00      # $ net  (and STRONG_MIN_PCT, stability >= STR
 PREMIUM_GOOD_PROFIT = 3.00        # $ net  (and GOOD_MIN_PCT)
 # Finishes where price depends on the pattern/phase, so name-based averages are unreliable -> skipped
 PATTERN_DEPENDENT = []   # finishes to skip (none - everything allowed)
+
+# Blue gun skins (own channel). Matches if any of these is in the skin name - edit freely.
+BLUE_SKINS = [
+    "ice coaled", "liquid", "blue laminate", "frontside misty", "blue phosphor", "desolate space",
+    "water elemental", "blue fissure", "blueprint", "cobalt disruption", "blue ply", "undertow",
+    "atheris", "fever dream", "cortex", "cyrex", "bunsen burner", "glacier mesh", "ice cap",
+    "sapphire", "azure", "blue steel", "oceanic", "hydroponic",
+]
+OUNCETRA_MAX_PRICE = 100.00       # USD
+OUNCETRA_MIN_DISCOUNT = 3.0       # % below CSFloat market price (he wants them cheap, not necessarily flips)
 
 # Cheap items (under ~1 EUR): a flat 7 cent net profit is enough to count as a nice deal
 CHEAP_MAX_PRICE = 1.15            # USD, roughly 1 EUR - adjust if the exchange rate moves
@@ -399,6 +410,11 @@ def get_charm_pattern(item):
     return None
 
 
+def is_blue_skin(name):
+    n = (name or "").lower()
+    return any(k in n for k in BLUE_SKINS)
+
+
 def item_category(name_orig):
     n = (name_orig or "").lower()
     if "gloves" in n or "hand wraps" in n:
@@ -562,6 +578,14 @@ def evaluate(listing):
             if ok:
                 return ("EXTREME FLOAT", f"{msg} | paying ${price:.2f} vs base ${base:.2f}",
                         16711680, "🎯 EXTREME FLOAT")
+
+    # 5a. blue gun skins -> their own channel (guns only, below market, no stickers)
+    if item_category(name_orig) == "gun" and is_blue_skin(name) and not is_souvenir(name, item) \
+            and not item.get("stickers") and not charm_item and MIN_SKIN_PRICE <= price <= OUNCETRA_MAX_PRICE:
+        b = get_base_price(listing)
+        if b and (b - price) / b * 100 >= OUNCETRA_MIN_DISCOUNT:
+            return ("BLUE SKIN", f"{(b - price) / b * 100:.0f}% below market ({money(b)})",
+                    3447003, "💙 BLUE SKIN DEAL", "ouncetra")
 
     # 5. deal vs market, judged on profit AFTER fees, with volatility filter
     cat = item_category(name_orig)
