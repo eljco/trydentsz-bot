@@ -29,18 +29,30 @@ MAX_SP = 4.2
 # Charm patterns: only alert on standalone charms (not charms attached to guns)
 ALLOW_CHARMS_ON_GUNS = False
 
-# Gun skin pattern alerts (uses the same pattern list). Off by default.
-ENABLE_SKIN_PATTERNS = False
+# Gun skin pattern alerts (own pattern list, guns only have seeds 0-1000)
+ENABLE_SKIN_PATTERNS = True
+
+# "Fair price" rule for float + gun-pattern alerts. The base price is read live from CSFloat
+# (listing.reference.base_price), nothing is hardcoded. You may pay at most:
+#   base_price * (1 + FAIR_PREMIUM_PCT/100) + FAIR_SLACK
+FAIR_PREMIUM_PCT = 25.0   # % above base price allowed
+FAIR_SLACK = 0.30         # extra flat amount allowed (so 20 cent skins aren't impossible)
 
 # Set DEBUG_DUMP=true in the workflow to print one listing's raw sticker/price fields
 DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
 _dumped = False
 _sp_warned = False
 
-EXACT_PATTERNS = {
+# Charm templates go up to 5 digits
+CHARM_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
     69, 6969, 420, 42069, 4545, 8989, 2323, 12223,
     222, 333, 444, 555, 666, 777, 888, 999, 1337, 404,
+}
+
+# Gun pattern seeds only go 0-1000, so only values in that range belong here
+SKIN_PATTERNS = {
+    111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 999, 404,
 }
 
 POLLS_PER_RUN = 5
@@ -79,15 +91,17 @@ def send_discord_alert(title, skin_name, price, float_val, identifier, details, 
 
 
 # ---------------- CHECKS ----------------
-def check_pattern(pattern_num):
+def check_pattern(pattern_num, exact_set, max_value=None):
     if pattern_num is None:
         return False
     try:
         n = int(pattern_num)
     except (TypeError, ValueError):
         return False
+    if max_value is not None and n > max_value:
+        return False
     p_str = str(n)
-    if n in EXACT_PATTERNS:
+    if n in exact_set:
         return True
     if len(p_str) >= 3 and p_str == p_str[::-1]:  # palindrome
         return True
@@ -114,6 +128,24 @@ def check_stickers(item_data):
         if any(prem in s_name for prem in PREMIUM_STICKERS):
             found.append(sticker.get("name"))
     return found or None
+
+
+def is_souvenir(name, item_data):
+    return bool(item_data.get("is_souvenir")) or name.startswith("souvenir ")
+
+
+def get_base_price(listing):
+    """Live base price (in dollars) from CSFloat's own reference data, or None."""
+    base = (listing.get("reference") or {}).get("base_price")
+    return base / 100.0 if base else None
+
+
+def fair_price_ok(listing, price):
+    base = get_base_price(listing)
+    if base is None:
+        return False, None
+    allowed = base * (1 + FAIR_PREMIUM_PCT / 100.0) + FAIR_SLACK
+    return price <= allowed, base
 
 
 def compute_sp(listing, item_data):
@@ -236,14 +268,15 @@ def poll_csfloat_api():
 
         # 1. Rare charm pattern (no price cap)
         charm_ok = is_standalone_charm(name) or ALLOW_CHARMS_ON_GUNS
-        if charm_ok and charm_pattern is not None and check_pattern(charm_pattern):
+        if charm_ok and charm_pattern is not None and check_pattern(charm_pattern, CHARM_PATTERNS):
             send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val,
                                charm_pattern, f"Matched charm pattern: {charm_pattern}", listing_id)
             alerted = True
 
         # 2. Premium sticker crafts (price cap AND SP cap)
         if not alerted:
-            matched = check_stickers(item_data)
+            # Souvenir stickers are not crafts (and inflate sticker value), so skip souvenirs
+            matched = None if is_souvenir(name, item_data) else check_stickers(item_data)
             if matched and price <= MAX_SKIN_PRICE:
                 sp = compute_sp(listing, item_data)
                 if sp is None:
@@ -258,21 +291,27 @@ def poll_csfloat_api():
                                        f"{sp:.1f}% SP", f"{sp:.1f}% SP | Stickers: {s}", listing_id)
                     alerted = True
 
-        # 3. Rare skin pattern (off by default)
+        # 3. Rare gun pattern (fair price vs live base price only)
         if (not alerted and ENABLE_SKIN_PATTERNS and not is_standalone_charm(name)
-                and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE):
-            send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val,
-                               skin_pattern, f"Matched pattern template: {skin_pattern}", listing_id)
-            alerted = True
+                and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000)
+                and price <= MAX_SKIN_PRICE):
+            ok, base = fair_price_ok(listing, price)
+            if ok:
+                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val,
+                                   skin_pattern,
+                                   f"Pattern {skin_pattern} at fair price (base ${base:.2f})", listing_id)
+                alerted = True
 
-        # 4. Extreme float
-        if not alerted:
+        # 4. Extreme float (fair price vs live base price only)
+        if not alerted and not is_standalone_charm(name):
             float_msg = check_float(float_val)
             if float_msg and price <= MAX_SKIN_PRICE:
-                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val,
-                                   skin_pattern if skin_pattern is not None else "N/A",
-                                   f"{float_msg} under limit", listing_id)
-                alerted = True
+                ok, base = fair_price_ok(listing, price)
+                if ok:
+                    send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val,
+                                       skin_pattern if skin_pattern is not None else "N/A",
+                                       f"{float_msg} | paying ${price:.2f} vs base ${base:.2f}", listing_id)
+                    alerted = True
 
         if alerted and listing_id:
             SEEN_IDS.add(listing_id)
