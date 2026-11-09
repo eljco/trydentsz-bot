@@ -1,8 +1,6 @@
 name: CS2 Cloud Sniper
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       send_test_alert:
