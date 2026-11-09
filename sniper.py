@@ -38,7 +38,7 @@ FAIL_ALERT_AFTER = 0 if BOUNDED else 10 # only for always-on mode (0 = off)
 # --- what to look for ---
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
 MAX_SKIN_PRICE = 35.00       # USD
-MIN_SKIN_PRICE = 0.10
+MIN_SKIN_PRICE = 0.10        # cheap skins allowed again, but they must clear CHEAP_MIN_PROFIT below
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
@@ -55,9 +55,24 @@ FAIR_SLACK = 0.30
 ENABLE_DEALS = True
 DEALS_ANY_WEAPON = True      # False = only TARGET_WEAPONS
 DEAL_MIN_DISCOUNT_VS_BASE = 8.0   # % below CSFloat base price (cheap pre-filter)
-DEAL_MIN_DISCOUNT_VS_AVG = 5.0    # % below average of last sales (must pass to alert)
-DEAL_STRONG_VS_AVG = 10.0         # >= this = "STRONG BUY", otherwise "GOOD DEAL"
-DEAL_MIN_SALES = 3                # need at least this many recent sales (liquidity check)
+DEAL_MIN_SALES = 5                # need at least this many recent sales (liquidity check)
+
+# profit is judged AFTER fees. CSFloat takes ~2% when you sell there.
+SELL_FEE = 0.02
+# Hard filters - anything failing these is never posted
+MIN_STABILITY = 3                 # stability score /10; 0-2 (very volatile) = never alert
+# Tiers (net profit = conservative resale price after fees - listing price)
+STRONG_MIN_PROFIT = 1.00          # $  and
+STRONG_MIN_PCT = 8.0              # %  and stability >= STRONG_MIN_STABILITY
+STRONG_MIN_STABILITY = 5
+GOOD_MIN_PROFIT = 0.30
+GOOD_MIN_PCT = 4.0
+# Cheap items (under ~1 EUR): a flat 7 cent net profit is enough to count as a nice deal
+CHEAP_MAX_PRICE = 1.15            # USD, roughly 1 EUR - adjust if the exchange rate moves
+CHEAP_MIN_PROFIT = 0.07           # $ net after fees
+# "Break even" tier: tiny profit, still shown but clearly labelled (needs a non-volatile skin)
+BREAKEVEN_MIN_PROFIT = 0.0
+BREAKEVEN_MIN_STABILITY = 4
 
 # --- price comparison sources ---
 ENABLE_SKINPORT = True
@@ -270,6 +285,7 @@ def summarize_sales(sales):
     return {
         "n": len(prices),
         "avg": avg,
+        "median": statistics.median(prices),
         "avg_float": statistics.mean(floats) if floats else None,
         "min": min(prices), "max": max(prices),
         "stability": stability,
@@ -520,20 +536,31 @@ def evaluate(listing):
                 return ("EXTREME FLOAT", f"{msg} | paying ${price:.2f} vs base ${base:.2f}",
                         16711680, "🎯 EXTREME FLOAT")
 
-    # 5. great deal vs market (works on any skin if DEALS_ANY_WEAPON)
+    # 5. deal vs market, judged on profit AFTER fees, with volatility filter
     if ENABLE_DEALS and not charm_item and MIN_SKIN_PRICE <= price <= MAX_SKIN_PRICE \
             and (DEALS_ANY_WEAPON or is_target) and not item.get("stickers"):
         base = get_base_price(listing)
         if base and (base - price) / base * 100 >= DEAL_MIN_DISCOUNT_VS_BASE:
             s = summarize_sales(get_sales(name_orig))
-            if s and s["n"] >= DEAL_MIN_SALES:
-                below_avg = (s["avg"] - price) / s["avg"] * 100
-                if below_avg >= DEAL_MIN_DISCOUNT_VS_AVG:
-                    strong = below_avg >= DEAL_STRONG_VS_AVG
-                    return ("GREAT DEAL",
-                            f"{below_avg:.0f}% below avg sale price, {(base - price) / base * 100:.0f}% below market",
-                            16766720 if not strong else 5763719,
-                            "⭐ STRONG BUY" if strong else "👍 GOOD DEAL")
+            if s and s["n"] >= DEAL_MIN_SALES and s["stability"] >= MIN_STABILITY:
+                # conservative resale estimate: lower of average / median / market price
+                resale = min(s["avg"], s["median"], base)
+                net = resale * (1 - SELL_FEE) - price
+                net_pct = net / price * 100
+                trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
+                        f"| resale est. {money(resale)} | {(base - price) / base * 100:.0f}% below market")
+                if price <= CHEAP_MAX_PRICE:
+                    # cheap items: only alert on >= 7c net profit, nothing weaker
+                    if net >= CHEAP_MIN_PROFIT:
+                        return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)")
+                    return None
+                if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT \
+                        and s["stability"] >= STRONG_MIN_STABILITY:
+                    return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY")
+                if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
+                    return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL")
+                if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
+                    return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT")
     return None
 
 
