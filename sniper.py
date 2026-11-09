@@ -1,4 +1,3 @@
-
 import time
 import requests
 import os
@@ -32,7 +31,7 @@ def send_discord_alert(title, skin_name, price, float_val, pattern, details):
             "fields": [
                 {"name": "💰 Price", "value": f"${price}", "inline": True},
                 {"name": "✨ Float", "value": f"{float_val}", "inline": True},
-                {"name": "🔢 Pattern", "value": f"`{pattern}`", "inline": True}
+                {"name": "🔢 Pattern / Charm ID", "value": f"`{pattern}`", "inline": True}
             ],
             "footer": {"text": "Cloud Sniper • Running 24/7 on GitHub Actions"}
         }]
@@ -89,20 +88,26 @@ def poll_csfloat_api():
 
             price = item.get("price", 0) / 100.0
             float_val = item_data.get("float_value")
-            pattern = item_data.get("paint_index")
-            charm_pattern = item.get("charm", {}).get("pattern_index")
             
-            active_pattern = charm_pattern or pattern
+            # Separated Gun Skin Pattern vs Charm Pattern ID
+            skin_pattern = item_data.get("paint_index")
+            charm_data = item.get("charm")
+            charm_pattern = charm_data.get("pattern_index") if charm_data else None
 
-            # 1. Check Patterns / Charms
-            if check_pattern(active_pattern):
-                send_discord_alert("RARE PATTERN / CHARM FOUND!", name, price, float_val, active_pattern, f"Matched pattern: {active_pattern}")
+            # 1. Check Charm Pattern specifically if it's a charm listing
+            if charm_pattern and check_pattern(charm_pattern):
+                send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val, charm_pattern, f"Matched charm pattern: {charm_pattern}")
                 continue
 
-            # 2. Check Float Extremes
+            # 2. Check Gun Skin Pattern (if applicable for pattern-based skins)
+            if skin_pattern and check_pattern(skin_pattern):
+                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched skin pattern template: {skin_pattern}")
+                continue
+
+            # 3. Check Float Extremes
             float_msg = check_float(float_val)
             if float_msg:
-                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, pattern or "N/A", float_msg)
+                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", float_msg)
                 continue
 
     except Exception as e:
@@ -110,7 +115,6 @@ def poll_csfloat_api():
 
 if __name__ == "__main__":
     print("🚀 Cloud Sniper Bot starting poll loop...")
-    # Runs a few iterations per workflow trigger
     for _ in range(5):
         poll_csfloat_api()
         time.sleep(10)
