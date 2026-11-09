@@ -81,9 +81,15 @@ def check_stickers(item_data):
     return found_stickers if found_stickers else None
 
 def poll_csfloat_api():
-    """Scans CSFloat public listings API"""
+    """Scans CSFloat public listings API with bulletproof browser headers"""
     url = "https://csfloat.com/api/v1/listings?limit=25"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://csfloat.com/",
+        "Origin": "https://csfloat.com/"
+    }
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
@@ -142,9 +148,8 @@ if __name__ == "__main__":
     for _ in range(5):
         poll_csfloat_api()
         time.sleep(10)
-if __name__ == "__main__":
+
     print("🚀 Forcing manual test alert...")
-    # Send a fake test notification right now to verify Discord webhook
     send_discord_alert(
         "TEST ALERT: SNIPER IS ALIVE!", 
         "AK-47 | Frontside Misty (Field-Tested)", 
