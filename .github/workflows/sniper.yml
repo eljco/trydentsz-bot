@@ -4,10 +4,20 @@ on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      send_test_alert:
+        description: 'Send a test Discord alert'
+        type: boolean
+        default: false
+
+concurrency:
+  group: cs2-sniper
+  cancel-in-progress: false
 
 jobs:
   run-sniper:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -21,4 +31,8 @@ jobs:
         run: pip install requests
 
       - name: Run Sniper Script
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
         run: python sniper.py
