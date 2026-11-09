@@ -34,6 +34,6 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          DEBUG_DUMP: 'true'
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
         run: python sniper.py
- 
