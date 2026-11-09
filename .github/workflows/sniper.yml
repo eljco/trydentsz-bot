@@ -17,7 +17,7 @@ concurrency:
 jobs:
   run-sniper:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,12 +28,19 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: pip install requests brotli
+
+      - name: Restore seen listings
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-${{ github.run_id }}
+          restore-keys: seen-
 
       - name: Run Sniper Script
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
-          DEBUG_DUMP: 'true'
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
+          RUN_SECONDS: '270'
         run: python sniper.py
