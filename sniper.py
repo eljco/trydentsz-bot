@@ -14,6 +14,9 @@ PREMIUM_STICKERS = [
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016"
 ]
 
+# Max price limit for gun skins/sticker crafts (Euro)
+MAX_SKIN_PRICE = 40.00
+
 # Exact Patterns & Charms
 EXACT_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67, 
@@ -21,7 +24,7 @@ EXACT_PATTERNS = {
     222, 333, 444, 555, 666, 777, 888, 999, 1337, 404
 }
 
-def send_discord_alert(title, skin_name, price, float_val, pattern, details):
+def send_discord_alert(title, skin_name, price, float_val, identifier, details):
     payload = {
         "username": "trydentsz cs2 bot 🔥",
         "embeds": [{
@@ -29,11 +32,11 @@ def send_discord_alert(title, skin_name, price, float_val, pattern, details):
             "description": f"**{skin_name}**\n\n📌 **Trigger Details:** {details}",
             "color": 16711680,
             "fields": [
-                {"name": "💰 Price", "value": f"${price}", "inline": True},
+                {"name": "💰 Price", "value": f"€{price:.2f}", "inline": True},
                 {"name": "✨ Float", "value": f"{float_val}", "inline": True},
-                {"name": "🔢 Pattern / Charm ID", "value": f"`{pattern}`", "inline": True}
+                {"name": "🎯 Match Info", "value": f"`{identifier}`", "inline": True}
             ],
-            "footer": {"text": "Cloud Sniper • Running 24/7 on GitHub Actions"}
+            "footer": {"text": "Cloud Sniper • Monster Edition 24/7"}
         }]
     }
     try:
@@ -62,6 +65,21 @@ def check_float(float_val):
         return f"Ultra-High Float ({float_val})"
     return None
 
+def check_stickers(item_data):
+    """Scans item stickers array for premium tournament stickers"""
+    stickers = item_data.get("stickers", [])
+    if not stickers:
+        return None
+    
+    found_stickers = []
+    for sticker in stickers:
+        s_name = sticker.get("name", "").lower()
+        for prem in PREMIUM_STICKERS:
+            if prem in s_name:
+                found_stickers.append(sticker.get("name"))
+                break
+    return found_stickers if found_stickers else None
+
 def poll_csfloat_api():
     """Scans CSFloat public listings API"""
     url = "https://csfloat.com/api/v1/listings?limit=25"
@@ -89,32 +107,38 @@ def poll_csfloat_api():
             price = item.get("price", 0) / 100.0
             float_val = item_data.get("float_value")
             
-            # Separated Gun Skin Pattern vs Charm Pattern ID
             skin_pattern = item_data.get("paint_index")
             charm_data = item.get("charm")
             charm_pattern = charm_data.get("pattern_index") if charm_data else None
 
-            # 1. Check Charm Pattern specifically if it's a charm listing
+            # 1. Check Charms (No price cap restriction)
             if charm_pattern and check_pattern(charm_pattern):
-                send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val, charm_pattern, f"Matched charm pattern: {charm_pattern}")
+                send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val, charm_pattern, f"Matched charm pattern ID: {charm_pattern}")
                 continue
 
-            # 2. Check Gun Skin Pattern (if applicable for pattern-based skins)
-            if skin_pattern and check_pattern(skin_pattern):
-                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched skin pattern template: {skin_pattern}")
+            # 2. Check Premium Sticker Crafts (Enforcing <= €40 price limit)
+            matched_stickers = check_stickers(item_data)
+            if matched_stickers and price <= MAX_SKIN_PRICE:
+                sticker_list_str = ", ".join(matched_stickers)
+                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val, sticker_list_str, f"Found high-tier stickers under €40 limit! Stickers: {sticker_list_str}")
                 continue
 
-            # 3. Check Float Extremes
+            # 3. Check Gun Skin Patterns (Enforcing <= €40 price limit)
+            if skin_pattern and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE:
+                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched pattern template under €40: {skin_pattern}")
+                continue
+
+            # 4. Check Float Extremes (Enforcing <= €40 price limit)
             float_msg = check_float(float_val)
-            if float_msg:
-                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", float_msg)
+            if float_msg and price <= MAX_SKIN_PRICE:
+                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", f"{float_msg} under €40 limit")
                 continue
 
     except Exception as e:
         print(f"Polling exception: {e}")
 
 if __name__ == "__main__":
-    print("🚀 Cloud Sniper Bot starting poll loop...")
+    print("🚀 Cloud Sniper Bot (Monster Edition) starting poll loop...")
     for _ in range(5):
         poll_csfloat_api()
         time.sleep(10)
