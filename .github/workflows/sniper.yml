@@ -14,10 +14,14 @@ concurrency:
   group: cs2-sniper
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   run-sniper:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -42,5 +46,12 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
-          RUN_SECONDS: '270'
+          RUN_SECONDS: '900'
         run: python sniper.py
+
+      - name: Start next run
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run "CS2 Cloud Sniper" --ref "${{ github.ref_name }}"
