@@ -47,6 +47,7 @@ jobs:
           DISCORD_WEBHOOK_CHEAP: ${{ secrets.DISCORD_WEBHOOK_CHEAP }}
           DISCORD_WEBHOOK_KNIVES: ${{ secrets.DISCORD_WEBHOOK_KNIVES }}
           DISCORD_WEBHOOK_GLOVES: ${{ secrets.DISCORD_WEBHOOK_GLOVES }}
+          DISCORD_WEBHOOK_OUNCETRA: ${{ secrets.DISCORD_WEBHOOK_OUNCETRA }}
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
           RUN_SECONDS: '900'
