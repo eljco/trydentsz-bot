@@ -1,63 +1,86 @@
-import time
-import requests
 import os
+import sys
+import time
+from datetime import datetime, timezone
 
-# Your Discord Webhook URL
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1569335516392988756/DCKSmOW9pS6rb7ncwC3eL56q_BcKAFjMfjx1atcxf5T2_GUG7lelOmEq2MPpLxfsHV9g"
+import requests
 
-# Your CSFloat API Key
-CSFLOAT_API_KEY = "XjjpTSVvh3REtzNEeyU0SY7H9gz9aMUd"
+# ---------------- CONFIG (secrets come from GitHub Actions) ----------------
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
+CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "").strip()
+SEND_TEST_ALERT = os.environ.get("SEND_TEST_ALERT", "false").lower() == "true"
 
-# Target Weapons
+if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
+    print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
+    sys.exit(1)
+
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
 
-# Premium Stickers for <= 4.2% SP
 PREMIUM_STICKERS = [
-    "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017", 
-    "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016"
+    "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
+    "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
 
-# Max price limit for gun skins/sticker crafts (Euro)
-MAX_SKIN_PRICE = 35.00
+MAX_SKIN_PRICE = 35.00  # in the currency CSFloat returns (USD); label below says EUR
 
-# Exact Patterns & Charms
 EXACT_PATTERNS = {
-    111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67, 
+    111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
     69, 6969, 420, 42069, 4545, 8989, 2323, 12223,
-    222, 333, 444, 555, 666, 777, 888, 999, 1337, 404
+    222, 333, 444, 555, 666, 777, 888, 999, 1337, 404,
 }
 
-def send_discord_alert(title, skin_name, price, float_val, identifier, details):
+POLLS_PER_RUN = 5
+POLL_INTERVAL = 10          # seconds between polls
+MAX_LISTING_AGE = 6 * 60    # only alert on listings newer than 6 min (avoids duplicates across runs)
+
+SEEN_IDS = set()
+
+
+# ---------------- DISCORD ----------------
+def send_discord_alert(title, skin_name, price, float_val, identifier, details, listing_id=None):
+    fields = [
+        {"name": "💰 Price", "value": f"${price:.2f}", "inline": True},
+        {"name": "✨ Float", "value": f"{float_val}", "inline": True},
+        {"name": "🎯 Match Info", "value": f"`{identifier}`", "inline": True},
+    ]
+    if listing_id:
+        fields.append({"name": "🔗 Listing", "value": f"https://csfloat.com/item/{listing_id}", "inline": False})
+
     payload = {
         "username": "trydentsz cs2 bot 🔥",
         "embeds": [{
             "title": f"🚨 {title}",
             "description": f"**{skin_name}**\n\n📌 **Trigger Details:** {details}",
             "color": 16711680,
-            "fields": [
-                {"name": "💰 Price", "value": f"€{price:.2f}", "inline": True},
-                {"name": "✨ Float", "value": f"{float_val}", "inline": True},
-                {"name": "🎯 Match Info", "value": f"`{identifier}`", "inline": True}
-            ],
-            "footer": {"text": "Cloud Sniper • Monster Edition 24/7"}
-        }]
+            "fields": fields,
+            "footer": {"text": "Cloud Sniper • Monster Edition 24/7"},
+        }],
     }
     try:
-        requests.post(DISCORD_WEBHOOK, json=payload)
+        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        if r.status_code >= 300:
+            print(f"Discord webhook error {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"Failed to send webhook: {e}")
 
+
+# ---------------- CHECKS ----------------
 def check_pattern(pattern_num):
-    if not pattern_num:
+    if pattern_num is None:
         return False
-    p_str = str(pattern_num)
-    if int(pattern_num) in EXACT_PATTERNS:
+    try:
+        n = int(pattern_num)
+    except (TypeError, ValueError):
+        return False
+    p_str = str(n)
+    if n in EXACT_PATTERNS:
         return True
-    if len(p_str) >= 3 and p_str == p_str[::-1]: # Palindrome
+    if len(p_str) >= 3 and p_str == p_str[::-1]:  # palindrome
         return True
-    if len(set(p_str)) == 1: # Repeaters like 7777
+    if len(p_str) >= 3 and len(set(p_str)) == 1:  # repeaters like 7777
         return True
     return False
+
 
 def check_float(float_val):
     if float_val is None:
@@ -68,98 +91,146 @@ def check_float(float_val):
         return f"Ultra-High Float ({float_val})"
     return None
 
+
 def check_stickers(item_data):
-    """Scans item stickers array for premium tournament stickers"""
-    stickers = item_data.get("stickers", [])
-    if not stickers:
-        return None
-    
-    found_stickers = []
+    stickers = item_data.get("stickers") or []
+    found = []
     for sticker in stickers:
-        s_name = sticker.get("name", "").lower()
-        for prem in PREMIUM_STICKERS:
-            if prem in s_name:
-                found_stickers.append(sticker.get("name"))
-                break
-    return found_stickers if found_stickers else None
+        s_name = (sticker.get("name") or "").lower()
+        if any(prem in s_name for prem in PREMIUM_STICKERS):
+            found.append(sticker.get("name"))
+    return found or None
 
-def poll_csfloat_api():
-    """Scans CSFloat public listings API using your authenticated API key"""
-    url = "https://csfloat.com/api/v1/listings?limit=25"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://csfloat.com/",
-        "Origin": "https://csfloat.com/",
-        "Authorization": CSFLOAT_API_KEY
-    }
-    
+
+def get_charm_pattern(item_data):
+    """CSFloat exposes charms as 'keychains'; each has a 'pattern'."""
+    for k in item_data.get("keychains") or []:
+        p = k.get("pattern")
+        if p is not None:
+            return p
+    return None
+
+
+def is_fresh(listing):
+    created = listing.get("created_at")
+    if not created:
+        return True
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        print(f"API Response Status: {response.status_code}")
-        if response.status_code != 200:
-            print(f"API Error Details: {response.text}")
-            return
-        
-        listings = response.json()
-        if not isinstance(listings, list):
-            return
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return age <= MAX_LISTING_AGE
+    except Exception:
+        return True
 
-        for item in listings:
-            item_data = item.get("item", {})
-            name = item_data.get("market_hash_name", "").lower()
-            
-            # Filter weapons/charms
-            is_target = any(w in name for w in TARGET_WEAPONS) or item.get("charm") is not None
-            if not is_target:
-                continue
 
-            price = item.get("price", 0) / 100.0
-            float_val = item_data.get("float_value")
-            
-            skin_pattern = item_data.get("paint_index")
-            charm_data = item.get("charm")
-            charm_pattern = charm_data.get("pattern_index") if charm_data else None
+# ---------------- POLL ----------------
+def poll_csfloat_api():
+    """Returns True if the API call succeeded, False otherwise."""
+    url = "https://csfloat.com/api/v1/listings"
+    params = {"limit": 50, "sort_by": "most_recent", "type": "buy_now"}
+    headers = {
+        "Authorization": CSFLOAT_API_KEY,  # raw key, no "Bearer"
+        "User-Agent": "trydentsz-sniper/1.0",
+        "Accept": "application/json",
+    }
 
-            # 1. Check Charms (No price cap restriction)
-            if charm_pattern and check_pattern(charm_pattern):
-                send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val, charm_pattern, f"Matched charm pattern ID: {charm_pattern}")
-                continue
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+    except Exception as e:
+        print(f"Request exception: {e}")
+        return False
 
-            # 2. Check Premium Sticker Crafts (Enforcing <= €35 price limit)
-            matched_stickers = check_stickers(item_data)
-            if matched_stickers and price <= MAX_SKIN_PRICE:
-                sticker_list_str = ", ".join(matched_stickers)
-                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val, sticker_list_str, f"Found high-tier stickers under €35 limit! Stickers: {sticker_list_str}")
-                continue
+    print(f"API Response Status: {response.status_code}")
+    if response.status_code != 200:
+        body = response.text[:300].replace("\n", " ")
+        print(f"API Error Body: {body}")
+        if "cloudflare" in response.text.lower() or "just a moment" in response.text.lower():
+            print("-> Looks like a Cloudflare block of GitHub's IP range, not an auth problem.")
+        return False
 
-            # 3. Check Gun Skin Patterns (Enforcing <= €35 price limit)
-            if skin_pattern and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE:
-                send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val, skin_pattern, f"Matched pattern template under €35: {skin_pattern}")
-                continue
+    try:
+        data = response.json()
+    except Exception:
+        print("Response was not valid JSON.")
+        return False
 
-            # 4. Check Float Extremes (Enforcing <= €35 price limit)
+    listings = data if isinstance(data, list) else data.get("data", [])
+
+    for listing in listings:
+        listing_id = listing.get("id")
+        if listing_id in SEEN_IDS or not is_fresh(listing):
+            continue
+
+        item_data = listing.get("item", {}) or {}
+        name = (item_data.get("market_hash_name") or "").lower()
+        charm_pattern = get_charm_pattern(item_data)
+
+        is_target = any(w in name for w in TARGET_WEAPONS) or charm_pattern is not None
+        if not is_target:
+            continue
+
+        price = (listing.get("price") or 0) / 100.0
+        float_val = item_data.get("float_value")
+        skin_pattern = item_data.get("paint_seed")  # pattern template (paint_index is the skin ID)
+
+        alerted = False
+
+        # 1. Rare charm pattern (no price cap)
+        if charm_pattern is not None and check_pattern(charm_pattern):
+            send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val,
+                               charm_pattern, f"Matched charm pattern: {charm_pattern}", listing_id)
+            alerted = True
+
+        # 2. Premium sticker crafts
+        if not alerted:
+            matched = check_stickers(item_data)
+            if matched and price <= MAX_SKIN_PRICE:
+                s = ", ".join(matched)
+                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val,
+                                   s, f"High-tier stickers under limit! Stickers: {s}", listing_id)
+                alerted = True
+
+        # 3. Rare skin pattern
+        if not alerted and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE:
+            send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val,
+                               skin_pattern, f"Matched pattern template: {skin_pattern}", listing_id)
+            alerted = True
+
+        # 4. Extreme float
+        if not alerted:
             float_msg = check_float(float_val)
             if float_msg and price <= MAX_SKIN_PRICE:
-                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val, skin_pattern or "N/A", f"{float_msg} under €35 limit")
-                continue
+                send_discord_alert("EXTREME FLOAT ANOMALY!", name, price, float_val,
+                                   skin_pattern if skin_pattern is not None else "N/A",
+                                   f"{float_msg} under limit", listing_id)
+                alerted = True
 
-    except Exception as e:
-        print(f"Polling exception: {e}")
+        if alerted and listing_id:
+            SEEN_IDS.add(listing_id)
+
+    return True
+
 
 if __name__ == "__main__":
     print("🚀 Cloud Sniper Bot (Authenticated Monster Edition) starting poll loop...")
-    for _ in range(5):
-        poll_csfloat_api()
-        time.sleep(10)
 
-    print("🚀 Forcing manual test alert...")
-    send_discord_alert(
-        "TEST ALERT: SNIPER IS ALIVE!", 
-        "AK-47 | Frontside Misty (Field-Tested)", 
-        14.72, 
-        0.191136, 
-        "414", 
-        "Manual test trigger - checking Discord connection!"
-    )
+    successes = 0
+    for i in range(POLLS_PER_RUN):
+        if poll_csfloat_api():
+            successes += 1
+        if i < POLLS_PER_RUN - 1:
+            time.sleep(POLL_INTERVAL)
+
+    if SEND_TEST_ALERT:
+        print("🚀 Sending manual test alert...")
+        send_discord_alert(
+            "TEST ALERT: SNIPER IS ALIVE!",
+            "AK-47 | Frontside Misty (Field-Tested)",
+            14.72, 0.191136, "414",
+            "Manual test trigger - checking Discord connection!",
+        )
+
+    # Make the job go red if every poll failed, so 403s aren't hidden behind a green check
+    if successes == 0:
+        print("All polls failed.")
+        sys.exit(1)
