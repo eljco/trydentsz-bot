@@ -1,0 +1,25 @@
+name: CS2 Cloud Sniper
+
+on:
+  schedule:
+    # Runs automatically every 5 minutes around the clock
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-sniper:
+  runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run Sniper Script
+        run: python sniper.py
