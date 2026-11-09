@@ -1,6 +1,8 @@
 name: CS2 Cloud Sniper
 
 on:
+  schedule:
+    - cron: '*/30 * * * *'   # safety net: restarts the chain if it ever breaks (concurrency prevents overlap)
   workflow_dispatch:
     inputs:
       send_test_alert:
