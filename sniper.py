@@ -82,7 +82,7 @@ PREMIUM_MIN_SALES = 3
 PREMIUM_STRONG_PROFIT = 8.00      # $ net  (and STRONG_MIN_PCT, stability >= STRONG_MIN_STABILITY)
 PREMIUM_GOOD_PROFIT = 3.00        # $ net  (and GOOD_MIN_PCT)
 # Finishes where price depends on the pattern/phase, so name-based averages are unreliable -> skipped
-PATTERN_DEPENDENT = ["doppler", "marble fade", "fade", "case hardened", "crimson web", "slaughter", "blue gem"]
+PATTERN_DEPENDENT = []   # finishes to skip (none - everything allowed)
 
 # Cheap items (under ~1 EUR): a flat 7 cent net profit is enough to count as a nice deal
 CHEAP_MAX_PRICE = 1.15            # USD, roughly 1 EUR - adjust if the exchange rate moves
