@@ -23,6 +23,20 @@ PREMIUM_STICKERS = [
 
 MAX_SKIN_PRICE = 35.00  # in the currency CSFloat returns (USD); label below says EUR
 
+# Sticker crafts only alert if you pay at most this % of the sticker value (lower = better deal)
+MAX_SP = 4.2
+
+# Charm patterns: only alert on standalone charms (not charms attached to guns)
+ALLOW_CHARMS_ON_GUNS = False
+
+# Gun skin pattern alerts (uses the same pattern list). Off by default.
+ENABLE_SKIN_PATTERNS = False
+
+# Set DEBUG_DUMP=true in the workflow to print one listing's raw sticker/price fields
+DEBUG_DUMP = os.environ.get("DEBUG_DUMP", "false").lower() == "true"
+_dumped = False
+_sp_warned = False
+
 EXACT_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
     69, 6969, 420, 42069, 4545, 8989, 2323, 12223,
@@ -102,8 +116,41 @@ def check_stickers(item_data):
     return found or None
 
 
+def compute_sp(listing, item_data):
+    """
+    Sticker percentage = (price paid above the skin's base price) / (total sticker value) * 100.
+    Matches CSFloat's 'SP' badge. Returns None if it can't be calculated.
+    """
+    # Use a direct value if CSFloat ever exposes one
+    for key in ("sticker_percentage", "sp"):
+        v = listing.get(key, item_data.get(key))
+        if isinstance(v, (int, float)):
+            return float(v) * 100 if v <= 1 else float(v)
+
+    price = listing.get("price")
+    base = (listing.get("reference") or {}).get("base_price")
+    if price is None or base is None:
+        return None
+
+    sticker_total = 0
+    for s in item_data.get("stickers") or []:
+        ref_price = (s.get("reference") or {}).get("price")
+        if ref_price:
+            sticker_total += ref_price
+    if sticker_total <= 0:
+        return None
+
+    return max(price - base, 0) / sticker_total * 100
+
+
+def is_standalone_charm(name):
+    return name.startswith("charm |")
+
+
 def get_charm_pattern(item_data):
     """CSFloat exposes charms as 'keychains'; each has a 'pattern'."""
+    if item_data.get("keychain_pattern") is not None:  # standalone charm items
+        return item_data.get("keychain_pattern")
     for k in item_data.get("keychains") or []:
         p = k.get("pattern")
         if p is not None:
@@ -156,6 +203,18 @@ def poll_csfloat_api():
 
     listings = data if isinstance(data, list) else data.get("data", [])
 
+    global _dumped
+    if DEBUG_DUMP and not _dumped:
+        for l in listings:
+            if (l.get("item") or {}).get("stickers"):
+                import json
+                it = l["item"]
+                print("DEBUG price:", l.get("price"), "reference:", l.get("reference"))
+                print("DEBUG stickers:", json.dumps(it.get("stickers"))[:600])
+                print("DEBUG item keys:", list(it.keys()))
+                _dumped = True
+                break
+
     for listing in listings:
         listing_id = listing.get("id")
         if listing_id in SEEN_IDS or not is_fresh(listing):
@@ -165,7 +224,7 @@ def poll_csfloat_api():
         name = (item_data.get("market_hash_name") or "").lower()
         charm_pattern = get_charm_pattern(item_data)
 
-        is_target = any(w in name for w in TARGET_WEAPONS) or charm_pattern is not None
+        is_target = any(w in name for w in TARGET_WEAPONS) or is_standalone_charm(name)
         if not is_target:
             continue
 
@@ -176,22 +235,32 @@ def poll_csfloat_api():
         alerted = False
 
         # 1. Rare charm pattern (no price cap)
-        if charm_pattern is not None and check_pattern(charm_pattern):
+        charm_ok = is_standalone_charm(name) or ALLOW_CHARMS_ON_GUNS
+        if charm_ok and charm_pattern is not None and check_pattern(charm_pattern):
             send_discord_alert("RARE CHARM PATTERN FOUND!", name, price, float_val,
                                charm_pattern, f"Matched charm pattern: {charm_pattern}", listing_id)
             alerted = True
 
-        # 2. Premium sticker crafts
+        # 2. Premium sticker crafts (price cap AND SP cap)
         if not alerted:
             matched = check_stickers(item_data)
             if matched and price <= MAX_SKIN_PRICE:
-                s = ", ".join(matched)
-                send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val,
-                                   s, f"High-tier stickers under limit! Stickers: {s}", listing_id)
-                alerted = True
+                sp = compute_sp(listing, item_data)
+                if sp is None:
+                    global _sp_warned
+                    if not _sp_warned:
+                        print("Could not compute SP for a sticker listing - skipping those. "
+                              "Run with DEBUG_DUMP=true and send me the output.")
+                        _sp_warned = True
+                elif sp <= MAX_SP:
+                    s = ", ".join(matched)
+                    send_discord_alert("PREMIUM STICKER CRAFT FOUND!", name, price, float_val,
+                                       f"{sp:.1f}% SP", f"{sp:.1f}% SP | Stickers: {s}", listing_id)
+                    alerted = True
 
-        # 3. Rare skin pattern
-        if not alerted and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE:
+        # 3. Rare skin pattern (off by default)
+        if (not alerted and ENABLE_SKIN_PATTERNS and not is_standalone_charm(name)
+                and check_pattern(skin_pattern) and price <= MAX_SKIN_PRICE):
             send_discord_alert("RARE SKIN PATTERN FOUND!", name, price, float_val,
                                skin_pattern, f"Matched pattern template: {skin_pattern}", listing_id)
             alerted = True
