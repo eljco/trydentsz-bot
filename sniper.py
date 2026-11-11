@@ -1,16 +1,21 @@
 """
-CS2 Sniper - 24/7 edition
-- Runs forever in a loop (no GitHub Actions cron gaps), survives errors, backs off on rate limits
-- Scans CSFloat for new listings, compares against Skinport + CSFloat sale history
-- Posts "FLOAT SNIPER"-style embeds to Discord
+CS2 Sniper v3 - high-throughput edition
+- Adaptive rate limiting (reads CSFloat's x-ratelimit headers, backs off on 429, speeds back up)
+- Several price-sliced "newest" feeds + a "best_deal" feed, extra pages when the market is busy
+- Float-aware pre-filter using CSFloat's own reference price -> far fewer sales-history calls
+- Unverified alerts instead of silently dropping listings when sales data is rate limited
+- Discord posting runs in a background thread so alerts never slow down scanning
+- Optional status channel (DISCORD_WEBHOOK_STATUS) that shows exactly why listings did / didn't alert
 """
 import json
 import os
+import queue
 import signal
 import statistics
-from collections import Counter
 import sys
+import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -20,8 +25,8 @@ import requests
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 CSFLOAT_API_KEY = os.environ.get("CSFLOAT_API_KEY", "").strip()
 SEND_TEST_ALERT = os.environ.get("SEND_TEST_ALERT", "false").lower() == "true"
+STATUS_HOOK_ENV = os.environ.get("DISCORD_WEBHOOK_STATUS", "").strip()
 
-# Optional per-channel webhooks. If one isn't set, alerts for it fall back to the main webhook.
 WEBHOOKS = {
     "main": DISCORD_WEBHOOK,
     "cheap": os.environ.get("DISCORD_WEBHOOK_CHEAP", "").strip() or DISCORD_WEBHOOK,
@@ -35,85 +40,87 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     sys.exit(1)
 
 # --- loop timing ---
-# GitHub Actions mode: RUN_SECONDS > 0 -> poll for that long, then exit (cron starts the next run).
-# Local/VPS mode: RUN_SECONDS = 0 -> run forever.
-RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))
+# RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
 BOUNDED = RUN_SECONDS > 0
-POLL_INTERVAL = 8            # seconds between CSFloat polls
-# Max listing age to consider (10 hours). The seen-ids cache prevents repeat alerts.
+POLL_INTERVAL = 3            # target seconds per full cycle; the rate limiter slows this down if needed
 MAX_LISTING_AGE = 10 * 60 * 60
-HEARTBEAT_HOURS = 0 if BOUNDED else 6   # only for always-on mode
-FAIL_ALERT_AFTER = 0 if BOUNDED else 10 # only for always-on mode (0 = off)
+
+# Status reports (why things did/didn't alert). Always-on: hourly to status channel (or every 6h to main).
+# Actions mode: one report at the end of each run, only if a status webhook is set.
+STATUS_HOOK = STATUS_HOOK_ENV or (DISCORD_WEBHOOK if not BOUNDED else "")
+STATUS_EVERY_MIN = 60 if STATUS_HOOK_ENV else 360
+FAIL_ALERT_AFTER = 0 if BOUNDED else 10
+
+# --- feeds ---
+# (min_price_cents, max_price_cents, max_pages). Extra pages are only fetched when the whole page was new
+# (= the market moved faster than we poll). Knives/gloves go up to ~$260.
+RECENT_SLICES = [(0, 150, 3), (150, 500, 2), (500, 1500, 2), (1500, 3500, 1), (3500, 26000, 1)]
+# "best_deal" feed catches listings that are already heavily discounted, even if we missed them when new.
+DEAL_SLICES = [(0, 1500), (1500, 26000)]
+DEAL_FEED_EVERY = 3          # run the best_deal feeds every Nth cycle (0 = off)
+MAX_SALES_CALLS_PER_POLL = 10  # cap on sales-history lookups per cycle (cached per skin for 15 min)
 
 # --- what to look for ---
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
-MAX_SKIN_PRICE = 35.00       # USD
-MIN_SKIN_PRICE = 0.10        # cheap skins allowed again, but they must clear CHEAP_MIN_PROFIT below
+MAX_SKIN_PRICE = 35.00
+MIN_SKIN_PRICE = 0.10
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
-# Sticker crafts: max SP (% of total sticker value you pay above the skin's base price).
-# Depends on how many premium old-tournament stickers are on the gun (more stickers = higher SP is still a deal).
-MAX_SP_BY_COUNT = {1: 4.2, 2: 6.0, 3: 9.0, 4: 12.0}   # 4x craft: up to 12% SP counts as low
-STICKER_MAX_PRICE = MAX_SKIN_PRICE   # raise this (e.g. 300) - 4x old-tournament crafts usually cost far more than $35
+MAX_SP_BY_COUNT = {1: 5.0, 2: 7.0, 3: 10.0, 4: 14.0}
+STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $35
+# Generic craft rule: ANY gun (not only TARGET_WEAPONS) with valuable stickers applied cheaply
+GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0   # $ total sticker value (CSFloat reference prices)
+GENERIC_CRAFT_MAX_SP = 6.0               # % SP
 
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
 FAIR_PREMIUM_PCT = 25.0
 FAIR_SLACK = 0.30
 
-# --- general "great deal" scanner ---
+# --- general "deal" scanner ---
 ENABLE_DEALS = True
-DEALS_ANY_WEAPON = True      # False = only TARGET_WEAPONS
-DEAL_MIN_DISCOUNT_VS_BASE = 5.0   # % below CSFloat base price (cheap pre-filter) - was 8.0
-DEAL_MIN_SALES = 5                # need at least this many recent sales (liquidity check)
-DEAL_UNVERIFIED_DISCOUNT = 15.0   # if sales data can't be fetched (rate limit), still alert at this % below base
-# Each slice = its own request for the 50 newest listings in that price range (cents).
-# More slices = fewer missed listings when the market is busy.
-PRICE_SLICES = [(0, 300), (300, 1500), (1500, None)]
+DEALS_ANY_WEAPON = True
+DEAL_MIN_DISCOUNT = 3.0           # % below float-adjusted reference price (cheap pre-filter, no API call)
+PRED_CAP = 1.10                   # never trust a predicted price more than 10% above CSFloat base price
+DEAL_MIN_SALES = 3
+DEAL_UNVERIFIED_DISCOUNT = 8.0    # sales data unavailable -> still alert at this % below reference
+PREMIUM_UNVERIFIED_DISCOUNT = 12.0
+RETRY_MAX = 3                     # polls to wait for sales data before falling back
 
-# profit is judged AFTER fees. CSFloat takes ~2% when you sell there.
 SELL_FEE = 0.02
-# Hard filters - anything failing these is never posted
-MIN_STABILITY = 3                 # stability score /10; 0-2 (very volatile) = never alert
-# Tiers (net profit = conservative resale price after fees - listing price)
-STRONG_MIN_PROFIT = 1.00          # $  and
-STRONG_MIN_PCT = 8.0              # %  and stability >= STRONG_MIN_STABILITY
+MIN_STABILITY = 3
+STRONG_MIN_PROFIT = 0.75
+STRONG_MIN_PCT = 6.0
 STRONG_MIN_STABILITY = 5
-GOOD_MIN_PROFIT = 0.30
-GOOD_MIN_PCT = 4.0
-# Knives & gloves (posted to their own channels). Judged on % and $ net profit after fees.
-MAX_KNIFE_PRICE = 259.00      # ~225 EUR (at ~1.15 USD per EUR)
-MAX_GLOVE_PRICE = 259.00      # ~225 EUR
+GOOD_MIN_PROFIT = 0.15
+GOOD_MIN_PCT = 2.5
+MAX_KNIFE_PRICE = 259.00
+MAX_GLOVE_PRICE = 259.00
 PREMIUM_MIN_SALES = 3
-PREMIUM_STRONG_PROFIT = 8.00      # $ net  (and STRONG_MIN_PCT, stability >= STRONG_MIN_STABILITY)
-PREMIUM_GOOD_PROFIT = 3.00        # $ net  (and GOOD_MIN_PCT)
-# Finishes where price depends on the pattern/phase, so name-based averages are unreliable -> skipped
-PATTERN_DEPENDENT = []   # finishes to skip (none - everything allowed)
+PREMIUM_STRONG_PROFIT = 5.00
+PREMIUM_GOOD_PROFIT = 2.00
+PATTERN_DEPENDENT = []
 
-# Blue gun skins (own channel). Matches if any of these is in the skin name - edit freely.
 BLUE_SKINS = [
     "ice coaled", "liquid", "blue laminate", "frontside misty", "blue phosphor", "desolate space",
     "water elemental", "blue fissure", "blueprint", "cobalt disruption", "blue ply", "undertow",
     "atheris", "fever dream", "cortex", "cyrex", "bunsen burner", "glacier mesh", "ice cap",
     "sapphire", "azure", "blue steel", "oceanic", "hydroponic",
 ]
-OUNCETRA_MAX_PRICE = 100.00       # USD
-OUNCETRA_MIN_DISCOUNT = 3.0       # % below CSFloat market price (he wants them cheap, not necessarily flips)
+OUNCETRA_MAX_PRICE = 100.00
+OUNCETRA_MIN_DISCOUNT = 3.0
 
-# Cheap items (under ~1 EUR): a flat 7 cent net profit is enough to count as a nice deal
-CHEAP_MAX_PRICE = 1.15            # USD, roughly 1 EUR - adjust if the exchange rate moves
-CHEAP_MIN_PROFIT = 0.07           # $ net after fees
-# "Break even" tier: tiny profit, still shown but clearly labelled (needs a non-volatile skin)
+CHEAP_MAX_PRICE = 1.15
+CHEAP_MIN_PROFIT = 0.07
 BREAKEVEN_MIN_PROFIT = 0.0
 BREAKEVEN_MIN_STABILITY = 4
 
-# --- price comparison sources ---
 ENABLE_SKINPORT = True
-SKINPORT_REFRESH = 330       # seconds (Skinport caches for 5 min, limit 8 req / 5 min)
-# SkinSwap: no verified public endpoint yet - see register_source() at the bottom.
+SKINPORT_REFRESH = 330
 
 CHARM_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
@@ -124,18 +131,24 @@ SKIN_PATTERNS = {111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 
 
 CSFLOAT = "https://csfloat.com/api/v1"
 SEEN_FILE = os.environ.get("SEEN_FILE", "seen_ids.json")
-MAX_SEEN = 5000
+MAX_SEEN = 20000
+REALERT_ON_DROP_PCT = 2.0    # a listing is re-evaluated if its price drops by at least this much
 
 # ================= STATE =================
 session = requests.Session()
-SEEN = {}                    # listing_id -> unix time
+SEEN = {}                    # listing_id -> [unix time, price_cents]
 HISTORY_CACHE = {}           # name -> (ts, sales)
-PRICE_SOURCES = {}           # source name -> {"fetch": fn, "data": {}, "ts": 0, "every": secs}
-REJ = Counter()              # why listings did NOT alert (printed at end of run)
-RETRIES = {}                 # listing_id -> attempts when sales data was unavailable
-SALES_BLOCK_UNTIL = 0
+SALES_CACHE_TTL = 900
+PRICE_SOURCES = {}
+REJ = Counter()
+HTTP = Counter()
+RETRIES = {}
 STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0}
+SALES_BUDGET = 0
+LAST_ALERT = 0.0
 RUNNING = True
+ALERTQ = queue.Queue()
+_REF_LOGGED = False
 
 
 def log(*a):
@@ -152,11 +165,18 @@ signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
 
+def sleep_interruptible(sec):
+    end = time.time() + sec
+    while RUNNING and time.time() < end:
+        time.sleep(min(1, max(0, end - time.time())))
+
+
 # ================= PERSISTENCE =================
 def load_seen():
     try:
         with open(SEEN_FILE) as f:
-            SEEN.update(json.load(f))
+            for k, v in json.load(f).items():
+                SEEN[k] = v if isinstance(v, list) else [v, 0]
         log(f"Loaded {len(SEEN)} seen listing ids")
     except Exception:
         pass
@@ -165,7 +185,7 @@ def load_seen():
 def save_seen():
     try:
         if len(SEEN) > MAX_SEEN:
-            for k, _ in sorted(SEEN.items(), key=lambda kv: kv[1])[: len(SEEN) - MAX_SEEN]:
+            for k, _ in sorted(SEEN.items(), key=lambda kv: kv[1][0])[: len(SEEN) - MAX_SEEN]:
                 SEEN.pop(k, None)
         with open(SEEN_FILE, "w") as f:
             json.dump(SEEN, f)
@@ -173,10 +193,19 @@ def save_seen():
         log("Could not save seen file:", e)
 
 
-# ================= DISCORD =================
-def post_discord(payload, webhook=None):
-    webhook = webhook or DISCORD_WEBHOOK
-    for _ in range(4):
+def is_seen(lid, price_cents):
+    e = SEEN.get(lid)
+    if e is None:
+        return False
+    old = e[1] if len(e) > 1 else 0
+    if price_cents and old and price_cents < old * (1 - REALERT_ON_DROP_PCT / 100.0):
+        return False   # price dropped -> evaluate again
+    return True
+
+
+# ================= DISCORD (background thread) =================
+def _post(payload, webhook):
+    for _ in range(5):
         try:
             r = session.post(webhook, json=payload, timeout=10)
         except Exception as e:
@@ -188,13 +217,42 @@ def post_discord(payload, webhook=None):
                 wait = float(r.json().get("retry_after", 2))
             except Exception:
                 wait = 2
-            time.sleep(wait + 0.5)
+            time.sleep(wait + 0.3)
             continue
         if r.status_code >= 300:
             log(f"Discord webhook error {r.status_code}: {r.text[:200]}")
             return False
         return True
     return False
+
+
+def discord_worker():
+    global LAST_ALERT
+    while True:
+        job = ALERTQ.get()
+        try:
+            if job is None:
+                return
+            payload, webhook, label = job
+            if _post(payload, webhook):
+                if label:
+                    STATS["alerts"] += 1
+                    LAST_ALERT = time.time()
+                    log(f"ALERT {label}")
+            time.sleep(0.4)
+        finally:
+            ALERTQ.task_done()
+
+
+def enqueue(payload, webhook, label=None):
+    if webhook:
+        ALERTQ.put((payload, webhook, label))
+
+
+def flush_queue(timeout=60):
+    end = time.time() + timeout
+    while ALERTQ.unfinished_tasks and time.time() < end:
+        time.sleep(0.5)
 
 
 def money(x):
@@ -214,8 +272,8 @@ def fmt_date(iso):
 
 
 def simple_message(text, color=3447003, webhook=None):
-    post_discord({"username": "trydentsz cs2 bot 🔥",
-                  "embeds": [{"description": text, "color": color}]}, webhook)
+    enqueue({"username": "trydentsz cs2 bot 🔥",
+             "embeds": [{"description": text, "color": color}]}, webhook or DISCORD_WEBHOOK)
 
 
 # ================= PRICE SOURCES =================
@@ -223,7 +281,7 @@ def fetch_skinport():
     r = session.get(
         "https://api.skinport.com/v1/items",
         params={"app_id": 730, "currency": "USD"},
-        headers={"Accept-Encoding": "br, gzip", "User-Agent": "trydentsz-sniper/2.0"},
+        headers={"Accept-Encoding": "br, gzip", "User-Agent": "trydentsz-sniper/3.0"},
         timeout=40,
     )
     r.raise_for_status()
@@ -241,10 +299,6 @@ def fetch_skinport():
 
 
 def register_source(name, fetch_fn, every):
-    """
-    Add a marketplace. fetch_fn() must return {market_hash_name: {"price": float, "url": str, "qty": int|None}}
-    Use this to plug in SkinSwap (or any other site) once you have its API details.
-    """
     PRICE_SOURCES[name] = {"fetch": fetch_fn, "data": {}, "ts": 0, "every": every}
 
 
@@ -253,7 +307,7 @@ def refresh_sources():
     for name, src in PRICE_SOURCES.items():
         if now - src["ts"] < src["every"]:
             continue
-        src["ts"] = now  # set first so failures don't hammer the API
+        src["ts"] = now
         try:
             src["data"] = src["fetch"]()
             log(f"{name}: loaded {len(src['data'])} prices")
@@ -262,7 +316,6 @@ def refresh_sources():
 
 
 def cheapest_elsewhere(name):
-    """Returns list of (source, price, url) for every source that has this item."""
     res = []
     for sname, src in PRICE_SOURCES.items():
         d = src["data"].get(name)
@@ -271,53 +324,125 @@ def cheapest_elsewhere(name):
     return sorted(res, key=lambda x: x[1])
 
 
-# ================= CSFLOAT HELPERS =================
-def csfloat_get(path, params=None, timeout=15):
-    return session.get(
+# ================= ADAPTIVE RATE LIMITING =================
+def _hnum(h, *keys):
+    for k in keys:
+        v = h.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+class Limiter:
+    """Spaces requests, honours x-ratelimit-* / Retry-After headers, slows down after 429s, recovers over time."""
+
+    def __init__(self, name, base_gap):
+        self.name = name
+        self.base_gap = base_gap
+        self.gap = base_gap
+        self.blocked_until = 0.0
+        self.last = 0.0
+        self.remaining = None
+        self.limit = None
+        self.reset_ts = None
+        self.streak = 0
+
+    def wait_needed(self):
+        now = time.time()
+        w = max(self.blocked_until - now, self.last + self.gap - now, 0.0)
+        if self.remaining is not None and self.remaining <= 1 and self.reset_ts and self.reset_ts > now:
+            w = max(w, min(self.reset_ts - now, 120))
+        return w
+
+    def update(self, r):
+        now = time.time()
+        h = r.headers
+        rem = _hnum(h, "x-ratelimit-remaining", "ratelimit-remaining")
+        lim = _hnum(h, "x-ratelimit-limit", "ratelimit-limit")
+        rst = _hnum(h, "x-ratelimit-reset", "ratelimit-reset")
+        if rem is not None:
+            self.remaining = rem
+        if lim is not None:
+            self.limit = lim
+        if rst is not None:
+            self.reset_ts = rst if rst > 1e9 else now + rst
+        if r.status_code == 429:
+            ra = _hnum(h, "retry-after")
+            if ra is None and self.reset_ts and self.reset_ts > now:
+                ra = self.reset_ts - now
+            self.blocked_until = now + min(ra or 30, 300)
+            self.gap = min(self.gap * 1.5, 5.0)
+            self.streak = 0
+            log(f"[{self.name}] 429 - paused {min(ra or 30, 300):.0f}s, gap now {self.gap:.2f}s")
+        else:
+            self.streak += 1
+            if self.streak >= 40 and self.gap > self.base_gap:
+                self.gap = max(self.base_gap, self.gap * 0.8)
+                self.streak = 0
+
+
+LIST_LIM = Limiter("listings", 0.35)
+HIST_LIM = Limiter("history", 0.6)
+
+
+def api_get(path, params, lim, max_wait):
+    """Returns Response, or None if we'd have to wait longer than max_wait."""
+    w = lim.wait_needed()
+    if w > max_wait:
+        return None
+    if w > 0:
+        sleep_interruptible(w)
+    lim.last = time.time()
+    r = session.get(
         f"{CSFLOAT}{path}",
         params=params,
         headers={"Authorization": CSFLOAT_API_KEY,
-                 "User-Agent": "trydentsz-sniper/2.0",
+                 "User-Agent": "trydentsz-sniper/3.0",
                  "Accept": "application/json"},
-        timeout=timeout,
+        timeout=15,
     )
+    lim.update(r)
+    HTTP[r.status_code] += 1
+    return r
 
 
-def get_sales(name):
-    """Returns list of sales, or None if it could not be fetched (rate limit / error)."""
-    global SALES_BLOCK_UNTIL
+# ================= SALES HISTORY =================
+def get_sales(name, budgeted=True):
+    """List of sales, or None if unavailable (budget used up / rate limited / error)."""
+    global SALES_BUDGET
     c = HISTORY_CACHE.get(name)
-    if c and time.time() - c[0] < 600:
+    if c and time.time() - c[0] < SALES_CACHE_TTL:
         return c[1]
-    if time.time() < SALES_BLOCK_UNTIL:
-        return None
+    if budgeted:
+        if SALES_BUDGET <= 0:
+            return None
+        SALES_BUDGET -= 1
     try:
-        r = csfloat_get(f"/history/{quote(name)}/sales")
-        if r.status_code == 429:
-            SALES_BLOCK_UNTIL = time.time() + float(r.headers.get("Retry-After", 30))
-            log("Sales history rate limited, pausing sales lookups")
-            return None
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        sales = data if isinstance(data, list) else data.get("data", [])
+        r = api_get(f"/history/{quote(name)}/sales", None, HIST_LIM, 3 if budgeted else 15)
     except Exception as e:
         log("sales fetch failed:", e)
         return None
-    if len(HISTORY_CACHE) > 500:
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    sales = data if isinstance(data, list) else data.get("data", [])
+    if len(HISTORY_CACHE) > 1500:
         HISTORY_CACHE.clear()
     HISTORY_CACHE[name] = (time.time(), sales)
     return sales
 
 
 def summarize_sales(sales):
-    """Last 10 sales without stickers -> averages, stability, last 3."""
     clean = []
     for s in sales or []:
         item = s.get("item") or {}
-        if item.get("stickers"):
-            continue
-        if not s.get("price"):
+        if item.get("stickers") or not s.get("price"):
             continue
         clean.append(s)
     clean.sort(key=lambda s: s.get("created_at") or "", reverse=True)
@@ -329,7 +454,7 @@ def summarize_sales(sales):
         return None
     avg = statistics.mean(prices)
     cv = statistics.pstdev(prices) / avg if len(prices) >= 3 and avg else 0
-    stability = max(0, min(10, round(10 - cv * 40)))
+    stability = max(0, min(10, round(10 - cv * 30)))
     return {
         "n": len(prices),
         "avg": avg,
@@ -342,7 +467,7 @@ def summarize_sales(sales):
     }
 
 
-# ================= CHECKS (unchanged logic) =================
+# ================= CHECKS =================
 def check_pattern(pattern_num, exact_set, max_value=None, generic=True):
     if pattern_num is None:
         return False
@@ -383,6 +508,10 @@ def check_stickers(item):
     return found or None
 
 
+def sticker_value(item):
+    return sum(((s.get("reference") or {}).get("price") or 0) for s in item.get("stickers") or []) / 100.0
+
+
 def is_souvenir(name, item):
     return bool(item.get("is_souvenir")) or name.startswith("souvenir ")
 
@@ -390,6 +519,11 @@ def is_souvenir(name, item):
 def get_base_price(listing):
     base = (listing.get("reference") or {}).get("base_price")
     return base / 100.0 if base else None
+
+
+def get_pred_price(listing):
+    pred = (listing.get("reference") or {}).get("predicted_price")
+    return pred / 100.0 if pred else None
 
 
 def fair_price_ok(listing, price):
@@ -461,7 +595,8 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
     seed = item.get("paint_seed")
     lid = listing.get("id")
     base = get_base_price(listing)
-    sales = summarize_sales(get_sales(name))
+    pred = get_pred_price(listing)
+    sales = summarize_sales(get_sales(name, budgeted=False))
     others = cheapest_elsewhere(name)
 
     discount = ((price - base) / base * 100) if base else None
@@ -473,7 +608,6 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
     if stats.get("total_trades") is not None:
         seller_txt += f" ({stats['total_trades']} trades)"
 
-    # float quality line
     float_q = ""
     if sales and sales["avg_float"] and float_val is not None:
         r = float_val / sales["avg_float"] if sales["avg_float"] else 1
@@ -498,6 +632,8 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         {"name": "🌱 Seed", "value": f"`{seed}`" if seed is not None else "?", "inline": True},
         {"name": "👤 Seller", "value": seller_txt, "inline": True},
     ]
+    if pred:
+        fields.append({"name": "🎯 Float-adjusted est.", "value": money(pred), "inline": True})
     if sales:
         fields += [
             {"name": f"📈 Avg {sales['n']} sales", "value": money(sales["avg"]), "inline": True},
@@ -511,7 +647,6 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
                                 f"Range {money(sales['min'])} – {money(sales['max'])} · {sales['n']} sales",
                        "inline": False})
 
-    # price comparison across other sites
     if others:
         lines = []
         for sname, p, url in others:
@@ -521,8 +656,6 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
             lines.append(f"{link}: **{money(p)}** ({diff:+.1f}% vs listing) {tag}")
         lines.append("_Other sites show lowest price for the skin, not float-matched._")
         fields.append({"name": "🏪 Price comparison", "value": "\n".join(lines)[:1000], "inline": False})
-        if price <= others[0][1]:
-            fields.append({"name": "✅ Best price", "value": "Cheapest vs all tracked sites.", "inline": False})
     else:
         fields.append({"name": "🏪 Price comparison", "value": "No other-site price found.", "inline": False})
 
@@ -544,7 +677,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         "description": "\n".join(desc),
         "color": color,
         "fields": fields,
-        "footer": {"text": f"Cloud Sniper • 24/7 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
+        "footer": {"text": f"Cloud Sniper v3 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
     }
     icon = item.get("icon_url")
     if icon:
@@ -554,7 +687,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
 
 # ================= LISTING EVALUATION =================
 def evaluate(listing):
-    """Returns (title, trigger_text, color, verdict) or None."""
+    """Returns (title, trigger_text, color, verdict[, channel]) or None or "RETRY"."""
     item = listing.get("item") or {}
     name_orig = item.get("market_hash_name") or ""
     name = name_orig.lower()
@@ -566,19 +699,21 @@ def evaluate(listing):
     charm_item = is_standalone_charm(name, item)
     charm_pattern = get_charm_pattern(item)
     is_target = any(w in name for w in TARGET_WEAPONS) or charm_item
+    cat = item_category(name_orig)
 
     # 1. rare charm pattern
     if is_target and (charm_item or ALLOW_CHARMS_ON_GUNS) and charm_pattern is not None \
             and check_pattern(charm_pattern, CHARM_PATTERNS):
         return ("RARE CHARM PATTERN", f"Matched charm pattern: {charm_pattern}", 16711680, "💎 RARE CHARM")
 
-    # 2. premium sticker craft (SP limit scales with number of premium stickers)
-    if is_target and not is_souvenir(name, item) and price <= STICKER_MAX_PRICE:
-        matched = check_stickers(item)
+    # 2. sticker crafts
+    if cat == "gun" and not charm_item and not is_souvenir(name, item) and price <= STICKER_MAX_PRICE \
+            and item.get("stickers"):
+        sp = compute_sp(listing, item)
+        matched = check_stickers(item) if is_target else None
         if matched:
             n_st = len(matched)
             limit = MAX_SP_BY_COUNT.get(min(n_st, max(MAX_SP_BY_COUNT)))
-            sp = compute_sp(listing, item)
             if sp is None:
                 REJ["craft: SP not computable"] += 1
             elif sp <= limit:
@@ -587,6 +722,12 @@ def evaluate(listing):
                         16711680, f"🏷️ {n_st}x STICKER CRAFT")
             else:
                 REJ["craft: SP too high"] += 1
+        sv = sticker_value(item)
+        if sp is not None and sv >= GENERIC_CRAFT_MIN_STICKER_VALUE and sp <= GENERIC_CRAFT_MAX_SP:
+            names = ", ".join(s.get("name", "?") for s in item.get("stickers") or [])
+            return ("STICKER CRAFT (LOW SP)",
+                    f"{sp:.1f}% SP on {money(sv)} of stickers | {names[:200]}",
+                    16711680, "🏷️ CHEAP STICKERS")
 
     # 3. rare gun pattern
     if (is_target and ENABLE_SKIN_PATTERNS and not charm_item and price <= MAX_SKIN_PRICE
@@ -596,8 +737,8 @@ def evaluate(listing):
             return ("RARE SKIN PATTERN", f"Pattern {skin_pattern} at fair price (base ${base:.2f})",
                     16711680, "🌱 RARE PATTERN")
 
-    # 4. extreme float
-    if is_target and not charm_item and price <= MAX_SKIN_PRICE:
+    # 4. extreme float (any gun)
+    if cat == "gun" and not charm_item and price <= MAX_SKIN_PRICE:
         msg = check_float(float_val)
         if msg:
             ok, base = fair_price_ok(listing, price)
@@ -605,16 +746,15 @@ def evaluate(listing):
                 return ("EXTREME FLOAT", f"{msg} | paying ${price:.2f} vs base ${base:.2f}",
                         16711680, "🎯 EXTREME FLOAT")
 
-    # 5a. blue gun skins -> their own channel (guns only, below market, no stickers)
-    if item_category(name_orig) == "gun" and is_blue_skin(name) and not is_souvenir(name, item) \
+    # 5a. blue gun skins
+    if cat == "gun" and is_blue_skin(name) and not is_souvenir(name, item) \
             and not item.get("stickers") and not charm_item and MIN_SKIN_PRICE <= price <= OUNCETRA_MAX_PRICE:
         b = get_base_price(listing)
         if b and (b - price) / b * 100 >= OUNCETRA_MIN_DISCOUNT:
             return ("BLUE SKIN", f"{(b - price) / b * 100:.0f}% below market ({money(b)})",
                     3447003, "💙 BLUE SKIN DEAL", "ouncetra")
 
-    # 5. deal vs market, judged on profit AFTER fees, with volatility filter
-    cat = item_category(name_orig)
+    # 5. deal vs market
     premium = cat in ("knives", "gloves")
     max_price = {"knives": MAX_KNIFE_PRICE, "gloves": MAX_GLOVE_PRICE}.get(cat, MAX_SKIN_PRICE)
     if not ENABLE_DEALS or charm_item or not (DEALS_ANY_WEAPON or is_target or premium):
@@ -623,7 +763,7 @@ def evaluate(listing):
         REJ["price out of range"] += 1
         return None
     if item.get("stickers"):
-        REJ["has stickers"] += 1
+        REJ["has stickers (not a craft)"] += 1
         return None
     if premium and any(k in name for k in PATTERN_DEPENDENT):
         return None
@@ -631,16 +771,25 @@ def evaluate(listing):
     if not base:
         REJ["no base price"] += 1
         return None
-    disc_base = (base - price) / base * 100
-    if disc_base < DEAL_MIN_DISCOUNT_VS_BASE:
-        REJ["not below base enough"] += 1
+    pred = get_pred_price(listing)
+    ref = min(pred, base * PRED_CAP) if pred else base   # float-adjusted reference
+    disc = (ref - price) / ref * 100
+    cheap = price <= CHEAP_MAX_PRICE and not premium
+    if disc < DEAL_MIN_DISCOUNT:
+        REJ["below reference < %.0f%%" % DEAL_MIN_DISCOUNT] += 1
+        return None
+    net_fast = ref * (1 - SELL_FEE) - price
+    if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
+        REJ["no edge after fees (pre-check)"] += 1
         return None
 
+    channel_fallback = "cheap" if cheap else (cat if premium else "main")
     sales = get_sales(name_orig)
-    if sales is None:  # rate limited / failed -> don't lose the listing
-        if disc_base >= DEAL_UNVERIFIED_DISCOUNT and not premium:
-            return ("DEAL (UNVERIFIED)", f"{disc_base:.0f}% below market - sales data unavailable",
-                    16766720, "⚠️ UNVERIFIED DEAL", "cheap" if price <= CHEAP_MAX_PRICE else "main")
+    if sales is None:
+        need = PREMIUM_UNVERIFIED_DISCOUNT if premium else DEAL_UNVERIFIED_DISCOUNT
+        if disc >= need:
+            return ("DEAL (UNVERIFIED)", f"{disc:.0f}% below float-adjusted market - sales data unavailable",
+                    16766720, "⚠️ UNVERIFIED DEAL", channel_fallback)
         return "RETRY"
     s = summarize_sales(sales)
     min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
@@ -651,12 +800,11 @@ def evaluate(listing):
         REJ["too volatile"] += 1
         return None
 
-    # conservative resale estimate: lower of average / median / market price
-    resale = min(s["avg"], s["median"], base)
+    resale = min(ref, s["median"])
     net = resale * (1 - SELL_FEE) - price
     net_pct = net / price * 100
     trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
-            f"| resale est. {money(resale)} | {disc_base:.0f}% below market")
+            f"| resale est. {money(resale)} | {disc:.0f}% below market")
     if premium:
         if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
                 and s["stability"] >= STRONG_MIN_STABILITY:
@@ -665,8 +813,7 @@ def evaluate(listing):
             return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", cat)
         REJ["premium profit too low"] += 1
         return None
-    if price <= CHEAP_MAX_PRICE:
-        # cheap items: only alert on >= 7c net profit, nothing weaker
+    if cheap:
         if net >= CHEAP_MIN_PROFIT:
             return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
         REJ["cheap profit too low"] += 1
@@ -676,66 +823,98 @@ def evaluate(listing):
     if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
         return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
     if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
-        return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT", "main")
+        return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / SMALL PROFIT", "main")
     REJ["profit too low"] += 1
     return None
 
 
 # ================= POLL =================
-def fetch_slice(lo, hi):
+def fetch_feed(sort, lo, hi, pages=1):
     """Returns (listings or None, sleep_override)."""
-    params = {"limit": 50, "sort_by": "most_recent", "type": "buy_now"}
-    if lo:
-        params["min_price"] = lo
-    if hi:
-        params["max_price"] = hi
-    try:
-        r = csfloat_get("/listings", params=params)
-    except Exception as e:
-        log("Request exception:", e)
-        return None, 15
-    if r.status_code == 429:
-        wait = float(r.headers.get("Retry-After", 60))
-        log(f"Rate limited, sleeping {wait:.0f}s")
-        return None, wait
-    if r.status_code != 200:
-        log(f"API error {r.status_code}: {r.text[:200]!r}")
-        if "just a moment" in r.text.lower() or "cloudflare" in r.text.lower():
-            return None, 120
-        return None, 30
-    try:
-        data = r.json()
-    except Exception:
-        log("Bad JSON from CSFloat")
-        return None, 15
-    return (data if isinstance(data, list) else data.get("data", [])), None
+    global _REF_LOGGED
+    out = []
+    got = False
+    for page in range(pages):
+        params = {"limit": 50, "sort_by": sort, "type": "buy_now"}
+        if lo:
+            params["min_price"] = lo
+        if hi:
+            params["max_price"] = hi
+        if page:
+            params["page"] = page
+        try:
+            r = api_get("/listings", params, LIST_LIM, 120)
+        except Exception as e:
+            log("Request exception:", e)
+            return (out if got else None), 15
+        if r is None:
+            return (out if got else None), min(LIST_LIM.wait_needed(), 120)
+        if r.status_code == 429:
+            return (out if got else None), max(LIST_LIM.blocked_until - time.time(), 1)
+        if r.status_code != 200:
+            log(f"API error {r.status_code}: {r.text[:200]!r}")
+            low = r.text.lower()
+            ov = 120 if ("just a moment" in low or "cloudflare" in low) else 30
+            return (out if got else None), ov
+        try:
+            data = r.json()
+        except Exception:
+            log("Bad JSON from CSFloat")
+            return (out if got else None), 15
+        batch = data if isinstance(data, list) else data.get("data", [])
+        got = True
+        if batch and not _REF_LOGGED:
+            _REF_LOGGED = True
+            log("Sample reference keys:", sorted((batch[0].get("reference") or {}).keys()),
+                "| rate limit headers:", {k: v for k, v in r.headers.items() if "ratelimit" in k.lower()})
+        for l in batch:
+            l["_feed"] = sort
+        out.extend(batch)
+        new = sum(1 for l in batch if l.get("id") and not is_seen(l["id"], l.get("price")))
+        if len(batch) < 50 or new < len(batch) * 0.8:
+            break   # we've caught up; no need for older pages
+    return out, None
 
 
 def poll_once():
-    """Returns (ok, sleep_override)."""
+    global SALES_BUDGET
+    SALES_BUDGET = MAX_SALES_CALLS_PER_POLL
+    feeds = [("most_recent", lo, hi, pg) for lo, hi, pg in RECENT_SLICES]
+    if DEAL_FEED_EVERY and STATS["polls"] % DEAL_FEED_EVERY == 0:
+        feeds += [("best_deal", lo, hi, 1) for lo, hi in DEAL_SLICES]
+
     all_listings = {}
     got_any = False
     override = None
-    for lo, hi in PRICE_SLICES:
-        listings, ov = fetch_slice(lo, hi)
+    for sort, lo, hi, pg in feeds:
+        if not RUNNING:
+            break
+        listings, ov = fetch_feed(sort, lo, hi, pg)
         if listings is None:
             override = max(override or 0, ov or 0)
-            continue  # keep going: other slices may still work
+            if ov and ov >= 30:
+                break   # blocked: don't hammer the remaining feeds
+            continue
         got_any = True
+        if ov:
+            override = max(override or 0, ov)
         for l in listings:
-            if l.get("id"):
-                all_listings[l["id"]] = l
-        time.sleep(0.4)
+            lid = l.get("id")
+            if lid and lid not in all_listings:
+                all_listings[lid] = l
     if not got_any:
         return False, override
 
     now = time.time()
     changed = False
-    for lid, listing in all_listings.items():
-        if lid in SEEN:
+    ordered = sorted(all_listings.values(), key=lambda l: l.get("created_at") or "", reverse=True)
+    for listing in ordered:
+        lid = listing["id"]
+        price_cents = listing.get("price") or 0
+        if is_seen(lid, price_cents):
             continue
-        if not is_fresh(listing):
-            SEEN[lid] = now
+        if listing.get("_feed") == "most_recent" and not is_fresh(listing):
+            SEEN[lid] = [now, price_cents]
             changed = True
             continue
         STATS["listings"] += 1
@@ -746,44 +925,67 @@ def poll_once():
             hit = None
         if hit == "RETRY":
             RETRIES[lid] = RETRIES.get(lid, 0) + 1
-            if RETRIES[lid] < 4:
+            if RETRIES[lid] < RETRY_MAX:
                 REJ["retry later (sales unavailable)"] += 1
-                continue  # NOT marked seen -> checked again next poll
+                continue
             hit = None
-        SEEN[lid] = now
+        RETRIES.pop(lid, None)
+        SEEN[lid] = [now, price_cents]
         changed = True
         if hit:
             title, trig, color, verdict = hit[:4]
             channel = hit[4] if len(hit) > 4 else "main"
             item = listing.get("item") or {}
-            price = (listing.get("price") or 0) / 100.0
+            price = price_cents / 100.0
             try:
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
-                if post_discord(payload, WEBHOOKS.get(channel)):
-                    STATS["alerts"] += 1
-                    log(f"ALERT[{channel}]: {title} {item.get('market_hash_name')} ${price:.2f}")
+                enqueue(payload, WEBHOOKS.get(channel) or DISCORD_WEBHOOK,
+                        f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}")
             except Exception as e:
                 log("Error building alert:", repr(e))
+    if len(RETRIES) > 2000:
+        RETRIES.clear()
     if changed:
         save_seen()
     return True, override if override else None
 
 
+# ================= STATUS =================
+def status_report(final=False):
+    if not STATUS_HOOK:
+        return
+    now = time.time()
+    last = f"{(now - LAST_ALERT) / 60:.0f} min ago" if LAST_ALERT else "none yet"
+    top = "\n".join(f"• {k}: {v}" for k, v in REJ.most_common(8)) or "-"
+    http = ", ".join(f"{k}: {v}" for k, v in sorted(HTTP.items())) or "-"
+    txt = (f"💓 **Sniper status** ({'run finished' if final else 'alive'})\n"
+           f"Polls: {STATS['polls']} · new listings checked: {STATS['listings']} · "
+           f"alerts: {STATS['alerts']} · last alert: {last}\n"
+           f"HTTP: {http}\n"
+           f"Listings limiter: limit {LIST_LIM.limit} / remaining {LIST_LIM.remaining} / gap {LIST_LIM.gap:.2f}s\n"
+           f"**Why listings did NOT alert:**\n{top}")
+    simple_message(txt, 3447003, STATUS_HOOK)
+    REJ.clear()
+
+
 # ================= MAIN LOOP =================
 def main():
-    log("🚀 Cloud Sniper 24/7 starting")
+    log("🚀 Cloud Sniper v3 starting")
     load_seen()
+    threading.Thread(target=discord_worker, daemon=True).start()
     if ENABLE_SKINPORT:
         register_source("Skinport", fetch_skinport, SKINPORT_REFRESH)
 
     if SEND_TEST_ALERT:
         for ch, hook in WEBHOOKS.items():
             simple_message(f"✅ **TEST ALERT:** sniper is alive — this is the **{ch}** channel.", 5763719, hook)
+        if STATUS_HOOK_ENV:
+            simple_message("✅ **TEST ALERT:** this is the **status** channel.", 5763719, STATUS_HOOK_ENV)
 
     fails = 0
     warned = False
     successes = 0
-    last_beat = time.time()
+    last_status = time.time()
     deadline = time.time() + RUN_SECONDS if BOUNDED else None
 
     while RUNNING:
@@ -793,7 +995,7 @@ def main():
         try:
             refresh_sources()
             ok, override = poll_once()
-        except Exception as e:  # nothing should ever kill the loop
+        except Exception as e:
             log("Unexpected error:", repr(e))
             ok, override = False, 20
 
@@ -801,7 +1003,7 @@ def main():
         if ok:
             successes += 1
             if warned:
-                simple_message("✅ Bot recovered, polling normally again.", 5763719)
+                simple_message("✅ Bot recovered, polling normally again.", 5763719, STATUS_HOOK or None)
                 warned = False
             fails = 0
         else:
@@ -809,31 +1011,30 @@ def main():
             STATS["errors"] += 1
             if FAIL_ALERT_AFTER and fails >= FAIL_ALERT_AFTER and not warned:
                 simple_message(f"⚠️ {fails} polls in a row failed (rate limit / block / API down). "
-                               f"Still retrying with backoff.", 15158332)
+                               f"Still retrying with backoff.", 15158332, STATUS_HOOK or None)
                 warned = True
 
-        if HEARTBEAT_HOURS and time.time() - last_beat >= HEARTBEAT_HOURS * 3600:
-            simple_message(f"💓 Alive — {STATS['polls']} polls, {STATS['listings']} new listings checked, "
-                           f"{STATS['alerts']} alerts, {STATS['errors']} errors.")
-            last_beat = time.time()
+        if not BOUNDED and time.time() - last_status >= STATUS_EVERY_MIN * 60:
+            status_report()
+            last_status = time.time()
 
-        # sleep: normal interval, or exponential backoff while failing
         if override:
             delay = override
         elif not ok:
-            delay = min(300, POLL_INTERVAL * (2 ** min(fails, 5)))
+            delay = min(300, POLL_INTERVAL * (2 ** min(fails, 6)))
         else:
-            delay = max(1, POLL_INTERVAL - (time.time() - loop_start))
+            delay = max(0.5, POLL_INTERVAL - (time.time() - loop_start))
         end = time.time() + delay
         if deadline:
             end = min(end, deadline)
-        while RUNNING and time.time() < end:
-            time.sleep(min(1, end - time.time()))
+        sleep_interruptible(end - time.time())
 
     save_seen()
-    log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['listings']} listings checked, {STATS['alerts']} alerts.")
+    log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['listings']} listings checked, "
+        f"{STATS['alerts']} alerts. HTTP: {dict(HTTP)}")
     log("Why listings did not alert:", dict(REJ))
-    # red job if every poll failed, so blocks/403s aren't hidden behind a green check
+    status_report(final=True)
+    flush_queue(60)
     if BOUNDED and successes == 0:
         sys.exit(1)
 
