@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import statistics
+from collections import Counter
 import sys
 import time
 from datetime import datetime, timezone
@@ -53,18 +54,25 @@ PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
-MAX_SP = 4.2                 # sticker crafts: max % of sticker value you pay above base
+# Sticker crafts: max SP (% of total sticker value you pay above the skin's base price).
+# Depends on how many premium old-tournament stickers are on the gun (more stickers = higher SP is still a deal).
+MAX_SP_BY_COUNT = {1: 4.2, 2: 6.0, 3: 9.0, 4: 12.0}   # 4x craft: up to 12% SP counts as low
+STICKER_MAX_PRICE = MAX_SKIN_PRICE   # raise this (e.g. 300) - 4x old-tournament crafts usually cost far more than $35
 
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
 FAIR_PREMIUM_PCT = 25.0
 FAIR_SLACK = 0.30
 
-# --- NEW: general "great deal" scanner (like the Five-SeveN example) ---
+# --- general "great deal" scanner ---
 ENABLE_DEALS = True
 DEALS_ANY_WEAPON = True      # False = only TARGET_WEAPONS
-DEAL_MIN_DISCOUNT_VS_BASE = 8.0   # % below CSFloat base price (cheap pre-filter)
+DEAL_MIN_DISCOUNT_VS_BASE = 5.0   # % below CSFloat base price (cheap pre-filter) - was 8.0
 DEAL_MIN_SALES = 5                # need at least this many recent sales (liquidity check)
+DEAL_UNVERIFIED_DISCOUNT = 15.0   # if sales data can't be fetched (rate limit), still alert at this % below base
+# Each slice = its own request for the 50 newest listings in that price range (cents).
+# More slices = fewer missed listings when the market is busy.
+PRICE_SLICES = [(0, 300), (300, 1500), (1500, None)]
 
 # profit is judged AFTER fees. CSFloat takes ~2% when you sell there.
 SELL_FEE = 0.02
@@ -123,6 +131,9 @@ session = requests.Session()
 SEEN = {}                    # listing_id -> unix time
 HISTORY_CACHE = {}           # name -> (ts, sales)
 PRICE_SOURCES = {}           # source name -> {"fetch": fn, "data": {}, "ts": 0, "every": secs}
+REJ = Counter()              # why listings did NOT alert (printed at end of run)
+RETRIES = {}                 # listing_id -> attempts when sales data was unavailable
+SALES_BLOCK_UNTIL = 0
 STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0}
 RUNNING = True
 
@@ -273,18 +284,26 @@ def csfloat_get(path, params=None, timeout=15):
 
 
 def get_sales(name):
+    """Returns list of sales, or None if it could not be fetched (rate limit / error)."""
+    global SALES_BLOCK_UNTIL
     c = HISTORY_CACHE.get(name)
     if c and time.time() - c[0] < 600:
         return c[1]
+    if time.time() < SALES_BLOCK_UNTIL:
+        return None
     try:
         r = csfloat_get(f"/history/{quote(name)}/sales")
+        if r.status_code == 429:
+            SALES_BLOCK_UNTIL = time.time() + float(r.headers.get("Retry-After", 30))
+            log("Sales history rate limited, pausing sales lookups")
+            return None
         if r.status_code != 200:
-            return []
+            return None
         data = r.json()
         sales = data if isinstance(data, list) else data.get("data", [])
     except Exception as e:
         log("sales fetch failed:", e)
-        return []
+        return None
     if len(HISTORY_CACHE) > 500:
         HISTORY_CACHE.clear()
     HISTORY_CACHE[name] = (time.time(), sales)
@@ -294,7 +313,7 @@ def get_sales(name):
 def summarize_sales(sales):
     """Last 10 sales without stickers -> averages, stability, last 3."""
     clean = []
-    for s in sales:
+    for s in sales or []:
         item = s.get("item") or {}
         if item.get("stickers"):
             continue
@@ -553,14 +572,21 @@ def evaluate(listing):
             and check_pattern(charm_pattern, CHARM_PATTERNS):
         return ("RARE CHARM PATTERN", f"Matched charm pattern: {charm_pattern}", 16711680, "💎 RARE CHARM")
 
-    # 2. premium sticker craft
-    if is_target and not is_souvenir(name, item) and price <= MAX_SKIN_PRICE:
+    # 2. premium sticker craft (SP limit scales with number of premium stickers)
+    if is_target and not is_souvenir(name, item) and price <= STICKER_MAX_PRICE:
         matched = check_stickers(item)
         if matched:
+            n_st = len(matched)
+            limit = MAX_SP_BY_COUNT.get(min(n_st, max(MAX_SP_BY_COUNT)))
             sp = compute_sp(listing, item)
-            if sp is not None and sp <= MAX_SP:
-                return ("PREMIUM STICKER CRAFT", f"{sp:.1f}% SP | Stickers: {', '.join(matched)}",
-                        16711680, "🏷️ STICKER CRAFT")
+            if sp is None:
+                REJ["craft: SP not computable"] += 1
+            elif sp <= limit:
+                return (f"PREMIUM STICKER CRAFT ({n_st}x)",
+                        f"{sp:.1f}% SP (limit {limit:.1f}%) | Stickers: {', '.join(matched)}",
+                        16711680, f"🏷️ {n_st}x STICKER CRAFT")
+            else:
+                REJ["craft: SP too high"] += 1
 
     # 3. rare gun pattern
     if (is_target and ENABLE_SKIN_PATTERNS and not charm_item and price <= MAX_SKIN_PRICE
@@ -591,96 +617,156 @@ def evaluate(listing):
     cat = item_category(name_orig)
     premium = cat in ("knives", "gloves")
     max_price = {"knives": MAX_KNIFE_PRICE, "gloves": MAX_GLOVE_PRICE}.get(cat, MAX_SKIN_PRICE)
-    if ENABLE_DEALS and not charm_item and MIN_SKIN_PRICE <= price <= max_price \
-            and (DEALS_ANY_WEAPON or is_target or premium) and not item.get("stickers"):
-        if premium and any(k in name for k in PATTERN_DEPENDENT):
-            return None
-        base = get_base_price(listing)
-        if base and (base - price) / base * 100 >= DEAL_MIN_DISCOUNT_VS_BASE:
-            s = summarize_sales(get_sales(name_orig))
-            min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
-            if s and s["n"] >= min_sales and s["stability"] >= MIN_STABILITY:
-                # conservative resale estimate: lower of average / median / market price
-                resale = min(s["avg"], s["median"], base)
-                net = resale * (1 - SELL_FEE) - price
-                net_pct = net / price * 100
-                trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
-                        f"| resale est. {money(resale)} | {(base - price) / base * 100:.0f}% below market")
-                if premium:
-                    if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
-                            and s["stability"] >= STRONG_MIN_STABILITY:
-                        return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", cat)
-                    if net >= PREMIUM_GOOD_PROFIT and net_pct >= GOOD_MIN_PCT:
-                        return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", cat)
-                    return None
-                if price <= CHEAP_MAX_PRICE:
-                    # cheap items: only alert on >= 7c net profit, nothing weaker
-                    if net >= CHEAP_MIN_PROFIT:
-                        return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
-                    return None
-                if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT \
-                        and s["stability"] >= STRONG_MIN_STABILITY:
-                    return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", "main")
-                if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
-                    return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
-                if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
-                    return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT", "main")
+    if not ENABLE_DEALS or charm_item or not (DEALS_ANY_WEAPON or is_target or premium):
+        return None
+    if not (MIN_SKIN_PRICE <= price <= max_price):
+        REJ["price out of range"] += 1
+        return None
+    if item.get("stickers"):
+        REJ["has stickers"] += 1
+        return None
+    if premium and any(k in name for k in PATTERN_DEPENDENT):
+        return None
+    base = get_base_price(listing)
+    if not base:
+        REJ["no base price"] += 1
+        return None
+    disc_base = (base - price) / base * 100
+    if disc_base < DEAL_MIN_DISCOUNT_VS_BASE:
+        REJ["not below base enough"] += 1
+        return None
+
+    sales = get_sales(name_orig)
+    if sales is None:  # rate limited / failed -> don't lose the listing
+        if disc_base >= DEAL_UNVERIFIED_DISCOUNT and not premium:
+            return ("DEAL (UNVERIFIED)", f"{disc_base:.0f}% below market - sales data unavailable",
+                    16766720, "⚠️ UNVERIFIED DEAL", "cheap" if price <= CHEAP_MAX_PRICE else "main")
+        return "RETRY"
+    s = summarize_sales(sales)
+    min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
+    if not s or s["n"] < min_sales:
+        REJ["too few sales"] += 1
+        return None
+    if s["stability"] < MIN_STABILITY:
+        REJ["too volatile"] += 1
+        return None
+
+    # conservative resale estimate: lower of average / median / market price
+    resale = min(s["avg"], s["median"], base)
+    net = resale * (1 - SELL_FEE) - price
+    net_pct = net / price * 100
+    trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
+            f"| resale est. {money(resale)} | {disc_base:.0f}% below market")
+    if premium:
+        if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
+                and s["stability"] >= STRONG_MIN_STABILITY:
+            return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", cat)
+        if net >= PREMIUM_GOOD_PROFIT and net_pct >= GOOD_MIN_PCT:
+            return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", cat)
+        REJ["premium profit too low"] += 1
+        return None
+    if price <= CHEAP_MAX_PRICE:
+        # cheap items: only alert on >= 7c net profit, nothing weaker
+        if net >= CHEAP_MIN_PROFIT:
+            return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
+        REJ["cheap profit too low"] += 1
+        return None
+    if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT and s["stability"] >= STRONG_MIN_STABILITY:
+        return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", "main")
+    if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
+        return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
+    if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
+        return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / ~1-3¢ PROFIT", "main")
+    REJ["profit too low"] += 1
     return None
 
 
 # ================= POLL =================
-def poll_once():
-    """Returns (ok, sleep_override)."""
+def fetch_slice(lo, hi):
+    """Returns (listings or None, sleep_override)."""
+    params = {"limit": 50, "sort_by": "most_recent", "type": "buy_now"}
+    if lo:
+        params["min_price"] = lo
+    if hi:
+        params["max_price"] = hi
     try:
-        r = csfloat_get("/listings", params={"limit": 50, "sort_by": "most_recent", "type": "buy_now"})
+        r = csfloat_get("/listings", params=params)
     except Exception as e:
         log("Request exception:", e)
-        return False, 15
-
+        return None, 15
     if r.status_code == 429:
         wait = float(r.headers.get("Retry-After", 60))
         log(f"Rate limited, sleeping {wait:.0f}s")
-        return False, wait
+        return None, wait
     if r.status_code != 200:
-        body = r.text[:200].replace("\n", " ")
-        log(f"API error {r.status_code}: {body}")
+        log(f"API error {r.status_code}: {r.text[:200]!r}")
         if "just a moment" in r.text.lower() or "cloudflare" in r.text.lower():
-            return False, 120
-        return False, 30
+            return None, 120
+        return None, 30
     try:
         data = r.json()
     except Exception:
         log("Bad JSON from CSFloat")
-        return False, 15
+        return None, 15
+    return (data if isinstance(data, list) else data.get("data", [])), None
 
-    listings = data if isinstance(data, list) else data.get("data", [])
+
+def poll_once():
+    """Returns (ok, sleep_override)."""
+    all_listings = {}
+    got_any = False
+    override = None
+    for lo, hi in PRICE_SLICES:
+        listings, ov = fetch_slice(lo, hi)
+        if listings is None:
+            override = max(override or 0, ov or 0)
+            continue  # keep going: other slices may still work
+        got_any = True
+        for l in listings:
+            if l.get("id"):
+                all_listings[l["id"]] = l
+        time.sleep(0.4)
+    if not got_any:
+        return False, override
+
     now = time.time()
-    new_seen = False
-    for listing in listings:
-        lid = listing.get("id")
-        if not lid or lid in SEEN:
+    changed = False
+    for lid, listing in all_listings.items():
+        if lid in SEEN:
             continue
-        SEEN[lid] = now
-        new_seen = True
         if not is_fresh(listing):
+            SEEN[lid] = now
+            changed = True
             continue
         STATS["listings"] += 1
         try:
             hit = evaluate(listing)
-            if hit:
-                title, trig, color, verdict = hit[:4]
-                channel = hit[4] if len(hit) > 4 else "main"
-                item = listing.get("item") or {}
-                price = (listing.get("price") or 0) / 100.0
+        except Exception as e:
+            log("Error evaluating listing:", repr(e))
+            hit = None
+        if hit == "RETRY":
+            RETRIES[lid] = RETRIES.get(lid, 0) + 1
+            if RETRIES[lid] < 4:
+                REJ["retry later (sales unavailable)"] += 1
+                continue  # NOT marked seen -> checked again next poll
+            hit = None
+        SEEN[lid] = now
+        changed = True
+        if hit:
+            title, trig, color, verdict = hit[:4]
+            channel = hit[4] if len(hit) > 4 else "main"
+            item = listing.get("item") or {}
+            price = (listing.get("price") or 0) / 100.0
+            try:
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
                 if post_discord(payload, WEBHOOKS.get(channel)):
                     STATS["alerts"] += 1
                     log(f"ALERT[{channel}]: {title} {item.get('market_hash_name')} ${price:.2f}")
-        except Exception as e:
-            log("Error evaluating listing:", repr(e))
-    if new_seen:
+            except Exception as e:
+                log("Error building alert:", repr(e))
+    if changed:
         save_seen()
-    return True, None
+    return True, override if override else None
 
 
 # ================= MAIN LOOP =================
@@ -745,7 +831,8 @@ def main():
             time.sleep(min(1, end - time.time()))
 
     save_seen()
-    log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['alerts']} alerts.")
+    log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['listings']} listings checked, {STATS['alerts']} alerts.")
+    log("Why listings did not alert:", dict(REJ))
     # red job if every poll failed, so blocks/403s aren't hidden behind a green check
     if BOUNDED and successes == 0:
         sys.exit(1)
