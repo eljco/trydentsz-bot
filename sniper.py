@@ -71,6 +71,16 @@ FEED_PLAN = [
 ]
 FEED_DISABLED = set()
 FEED_I = 0
+# --- craft hunter: dedicated queries for listings carrying the most valuable premium stickers ---
+# The bot LEARNS sticker ids from listings it sees, then every CRAFT_FEED_EVERY-th request asks CSFloat for the
+# CHEAPEST listings carrying one of the top stickers (cheapest skin + expensive sticker = lowest SP).
+CRAFT_FEED_EVERY = 3
+CRAFT_TOP_N = 20                  # how many of the most valuable learned stickers to rotate through
+CRAFT_MIN_STICKER_CENTS = 300     # ignore stickers worth less than $3
+EXTRA_STICKER_IDS = []            # optional: add CSFloat sticker ids you always want checked, e.g. [123, 456]
+STICKER_FILE = os.environ.get("STICKER_FILE", "sticker_ids.json")
+EXCLUDE_SOUVENIRS = True          # souvenirs are skipped completely (no alerts of any kind)
+STICKER_ITEM_MIN_VALUE = 5.0      # '~free stickers' alerts need at least this much sticker value ($)
 STICKER_ITEM_MIN_DISCOUNT = 5.0   # stickered item priced this far under the CLEAN skin price = stickers ~free
 MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached per skin for 15 min)
 
@@ -91,6 +101,9 @@ STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $35
 GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0   # $ total sticker value (CSFloat reference prices)
 GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP               # % SP
 
+# Charms attached to a gun are part of its value: they count in the discount AND the profit estimate.
+CHARM_VALUE_FACTOR = 1.0          # share of the charm's value counted (lower it, e.g. 0.7, to be more cautious)
+CHARM_FALLBACK_MAX_USD = 1.00     # if CSFloat gives no charm price, use (float est. - base) but only up to this
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
 FAIR_PREMIUM_PCT = 25.0
@@ -100,13 +113,18 @@ FAIR_SLACK = 0.30
 ENABLE_DEALS = True
 DEALS_ANY_WEAPON = True
 DEAL_MIN_DISCOUNT = 3.0           # % below float-adjusted reference price (cheap pre-filter, no API call)
-PRED_CAP = 1.10                   # never trust a predicted price more than 10% above CSFloat base price
+PRED_CAP = 1.00                   # CSFloat's float-adjusted price is NEVER trusted above the base price
+                                  # (it over-values extreme floats nobody actually pays for). It can only LOWER the estimate.
 DEAL_MIN_SALES = 3
 DEAL_UNVERIFIED_DISCOUNT = 8.0    # sales data unavailable -> still alert at this % below reference
 PREMIUM_UNVERIFIED_DISCOUNT = 12.0
 RETRY_MAX = 3                     # polls to wait for sales data before falling back
 
 SELL_FEE = 0.02
+# How resale value is estimated. The old rule used the LOWER of CSFloat's reference price and the recent
+# sales median, which under-estimates liquid skins you can really sell at/above the reference.
+RESALE_CAPPED_BY_MEDIAN = False   # True = old, pessimistic behaviour
+RESALE_BOOST_PCT = 0.0            # e.g. 2.0 if you routinely sell ~2% above CSFloat's reference price
 MIN_STABILITY = 3
 STRONG_MIN_PROFIT = 0.75
 STRONG_MIN_PCT = 6.0
@@ -158,7 +176,11 @@ PRICE_SOURCES = {}
 REJ = Counter()
 HTTP = Counter()
 RETRIES = {}
-STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0, "saturated": 0, "post_fail": 0, "blocked_s": 0}
+STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0, "saturated": 0, "post_fail": 0, "blocked_s": 0, "craft_polls": 0}
+STICKER_DB = {}               # sticker id -> [name, reference price cents]
+CRAFT_I = 0
+POLL_N = 0
+CRAFT_DISABLED = False
 LAST_REJ = None
 NEAR = []                    # best-looking listings that were rejected: (discount, name, price, reason, id)
 SALES_BUDGET = 0
@@ -216,6 +238,54 @@ def save_seen():
             json.dump(SEEN, f)
     except Exception as e:
         log("Could not save seen file:", e)
+
+
+def load_stickers():
+    try:
+        with open(STICKER_FILE) as f:
+            STICKER_DB.update(json.load(f))
+        log(f"Loaded {len(STICKER_DB)} learned sticker ids")
+    except Exception:
+        pass
+
+
+def save_stickers():
+    try:
+        with open(STICKER_FILE, "w") as f:
+            json.dump(STICKER_DB, f)
+    except Exception as e:
+        log("Could not save sticker file:", e)
+
+
+def learn_stickers(listings):
+    changed = False
+    for l in listings:
+        for st in (l.get("item") or {}).get("stickers") or []:
+            n = (st.get("name") or "").lower()
+            if not any(p in n for p in PREMIUM_STICKERS):
+                continue
+            sid = st.get("stickerId") or st.get("sticker_id")
+            if not sid:
+                continue
+            price = (st.get("reference") or {}).get("price") or 0
+            sid, old = str(sid), STICKER_DB.get(str(sid))
+            if not old or (price and abs(price - old[1]) > max(50, old[1] * 0.1)):
+                STICKER_DB[sid] = [st.get("name"), price]
+                changed = True
+    if changed:
+        save_stickers()
+
+
+def next_craft_id():
+    global CRAFT_I
+    ids = [str(i) for i in EXTRA_STICKER_IDS]
+    top = sorted(((k, v) for k, v in STICKER_DB.items() if v[1] >= CRAFT_MIN_STICKER_CENTS),
+                 key=lambda kv: kv[1][1], reverse=True)[:CRAFT_TOP_N]
+    ids += [k for k, _ in top if k not in ids]
+    if not ids:
+        return None
+    CRAFT_I += 1
+    return ids[CRAFT_I % len(ids)]
 
 
 def is_seen(lid, price_cents):
@@ -588,6 +658,21 @@ def compute_sp(listing, item):
     return max(price - base, 0) / total * 100
 
 
+def charm_bonus(listing, item):
+    """Value (USD, already discounted by CHARM_VALUE_FACTOR) of a charm attached to a gun."""
+    keys = item.get("keychains") or []
+    if not keys and item.get("keychain_pattern") is None:
+        return 0.0
+    val = sum(((k.get("reference") or {}).get("price") or 0) for k in keys) / 100.0
+    if val <= 0:   # no charm price from CSFloat -> small, capped part of its float estimate
+        base, pred = get_base_price(listing), get_pred_price(listing)
+        if base and pred and pred > base:
+            diff = pred - base
+            if diff <= CHARM_FALLBACK_MAX_USD and diff / base <= 0.15:
+                val = diff
+    return val * CHARM_VALUE_FACTOR
+
+
 def is_standalone_charm(name, item=None):
     return name.startswith("charm |")   # guns WITH a charm attached are still normal guns
 
@@ -671,7 +756,8 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         {"name": "👤 Seller", "value": seller_txt, "inline": True},
     ]
     if pred:
-        fields.append({"name": "🎯 Float-adjusted est.", "value": money(pred), "inline": True})
+        note = f"\n⚠️ +{(pred / base - 1) * 100:.0f}% vs base - ignored" if base and pred > base * 1.05 else ""
+        fields.append({"name": "🎯 CSFloat float est.", "value": money(pred) + note, "inline": True})
     if sales:
         fields += [
             {"name": f"📈 Avg {sales['n']} sales", "value": money(sales["avg"]), "inline": True},
@@ -741,6 +827,9 @@ def evaluate(listing):
     charm_pattern = get_charm_pattern(item)
     is_target = any(w in name for w in TARGET_WEAPONS) or charm_item
     cat = item_category(name_orig)
+    if EXCLUDE_SOUVENIRS and is_souvenir(name, item):
+        rej("souvenir (excluded)")
+        return None
 
     # 1. rare charm pattern
     if is_target and (charm_item or ALLOW_CHARMS_ON_GUNS) and charm_pattern is not None \
@@ -824,21 +913,28 @@ def evaluate(listing):
         return None
     pred = get_pred_price(listing)
     ref = min(pred, base * PRED_CAP) if pred else base   # float-adjusted reference
-    disc = (ref - price) / ref * 100
+    bonus = charm_bonus(listing, item)
+    ref_eff = ref + bonus                       # gun value + charm value = CSFloat "Final Price"
+    disc = (ref_eff - price) / ref_eff * 100
+    charm_note = f" | incl. {money(bonus)} charm bonus" if bonus > 0 else ""
     cheap = price <= CHEAP_MAX_PRICE and not premium
     if disc < DEAL_MIN_DISCOUNT:
         rej("below reference < %.0f%%" % DEAL_MIN_DISCOUNT)
         return None
-    net_fast = ref * (1 - SELL_FEE) - price
+    net_fast = ref_eff * (1 - SELL_FEE) - price
     if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
         rej("no edge after fees (pre-check)")
         return None
 
     channel_fallback = "cheap" if cheap else (cat if premium else "main")
     if has_st:
+        sv = sticker_value(item)
+        if sv < STICKER_ITEM_MIN_VALUE:
+            rej("stickers too cheap to matter")
+            return None
         if disc >= STICKER_ITEM_MIN_DISCOUNT and net_fast >= (CHEAP_MIN_PROFIT if cheap else GOOD_MIN_PROFIT):
-            return ("STICKERS ~FREE", f"{disc:.0f}% below the CLEAN-skin reference ({money(ref)}) and it has "
-                    f"stickers | est. profit after fees {money(net_fast)} - check sticker value",
+            return ("STICKERS ~FREE", f"{disc:.0f}% below the CLEAN-skin reference ({money(ref)}) with "
+                    f"{money(sv)} of stickers included | est. profit after fees {money(net_fast)}",
                     16766720, "🏷️ STICKERED ITEM BELOW CLEAN PRICE", channel_fallback)
         rej("has stickers (not a craft)")
         return None
@@ -854,7 +950,7 @@ def evaluate(listing):
         if net_fast >= need_profit and net_fast / price * 100 >= GOOD_MIN_PCT:
             return ("DEAL (REFERENCE ONLY)",
                     f"Est. profit after fees {money(net_fast)} ({net_fast / price * 100:+.0f}%) vs CSFloat "
-                    f"reference {money(ref)} | {disc:.0f}% below - no sales data, verify before buying",
+                    f"reference {money(ref)} | {disc:.0f}% below - no sales data, verify before buying{charm_note}",
                     16766720, "⚠️ UNVERIFIED DEAL (reference only)", channel_fallback)
         rej("no sales data + small edge")
         return None
@@ -867,11 +963,14 @@ def evaluate(listing):
         rej("too volatile")
         return None
 
-    resale = min(ref, s["median"])
+    if s["median"] < price:   # sanity check: recent sales are mostly BELOW what we'd pay
+        rej("recent sales median below listing price")
+        return None
+    resale = (min(ref, s["median"]) if RESALE_CAPPED_BY_MEDIAN else ref) * (1 + RESALE_BOOST_PCT / 100.0) + bonus
     net = resale * (1 - SELL_FEE) - price
     net_pct = net / price * 100
     trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
-            f"| resale est. {money(resale)} | {disc:.0f}% below market")
+            f"| resale est. {money(resale)} (recent median {money(s['median'])}) | {disc:.0f}% below market{charm_note}")
     if premium:
         if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
                 and s["stability"] >= STRONG_MIN_STABILITY:
@@ -896,7 +995,7 @@ def evaluate(listing):
 
 
 # ================= POLL =================
-def fetch_feed(sort, lo, hi):
+def fetch_feed(sort, lo, hi, extra=None, tag=None):
     """Returns (listings or None, sleep_override, is_error). Waiting for the limiter is NOT an error."""
     global _REF_LOGGED
     params = {"limit": 50, "sort_by": sort, "type": "buy_now"}
@@ -904,6 +1003,8 @@ def fetch_feed(sort, lo, hi):
         params["min_price"] = lo
     if hi:
         params["max_price"] = hi
+    if extra:
+        params.update(extra)
     try:
         r = api_get("/listings", params, LIST_LIM, 120)
     except Exception as e:
@@ -916,6 +1017,10 @@ def fetch_feed(sort, lo, hi):
     if r.status_code == 400 and sort == "best_deal":
         FEED_DISABLED.add(sort)
         log(f"best_deal sort rejected by CSFloat ({r.text[:150]!r}) - feed disabled, using most_recent only")
+        return None, 1, False
+    if r.status_code == 400 and extra and "stickers" in extra:
+        globals()["CRAFT_DISABLED"] = True
+        log(f"CSFloat rejected the sticker-filter query ({r.text[:150]!r}) - craft hunter disabled")
         return None, 1, False
     if r.status_code != 200:
         log(f"API error {r.status_code}: {r.text[:200]!r}")
@@ -932,7 +1037,7 @@ def fetch_feed(sort, lo, hi):
         log("Sample reference keys:", sorted((batch[0].get("reference") or {}).keys()),
             "| rate limit headers:", {k: v for k, v in r.headers.items() if "ratelimit" in k.lower()})
     for l in batch:
-        l["_feed"] = sort
+        l["_feed"] = tag or sort
     if sort == "most_recent" and len(batch) >= 50 \
             and all(not is_seen(l.get("id"), l.get("price")) for l in batch if l.get("id")):
         STATS["saturated"] += 1   # whole page was new -> listings appeared faster than we can fetch
@@ -949,15 +1054,29 @@ def next_feed():
     return None
 
 
+def choose_feed():
+    """Mostly the rotating plan; every CRAFT_FEED_EVERY-th request is a targeted sticker query."""
+    global POLL_N
+    POLL_N += 1
+    if CRAFT_FEED_EVERY and not CRAFT_DISABLED and POLL_N % CRAFT_FEED_EVERY == 0:
+        sid = next_craft_id()
+        if sid:
+            STATS["craft_polls"] += 1
+            return ("lowest_price", 0, int(STICKER_MAX_PRICE * 100), {"stickers": sid}, "craft")
+    f = next_feed()
+    return (f + (None, None)) if f else None
+
+
 def poll_once():
     global SALES_BUDGET, LAST_REJ
     SALES_BUDGET = MAX_SALES_CALLS_PER_POLL
-    feed = next_feed()
+    feed = choose_feed()
     if not feed:
         return False, 60
     listings, override, is_err = fetch_feed(*feed)
     if listings is None:
         return (not is_err), override
+    learn_stickers(listings)
     all_listings = {l["id"]: l for l in listings if l.get("id")}
 
     now = time.time()
@@ -1042,6 +1161,7 @@ def status_report(final=False):
            f"HTTP: {http}\n"
            f"Missed-window events: {STATS['saturated']} · time paused by rate limits: {STATS['blocked_s']:.0f}s · "
            f"undeliverable alerts: {STATS['post_fail']}\n"
+           f"Craft queries: {STATS['craft_polls']} · learned premium sticker ids: {len(STICKER_DB)}\n"
            f"Listings allowance: {LIST_LIM.remaining} of {LIST_LIM.limit} left, resets in "
            f"{max(0, (LIST_LIM.reset_ts or 0) - now):.0f}s · requests this run: {sum(HTTP.values())}\n"
            f"**Why listings did NOT alert:**\n{top}\n"
@@ -1054,6 +1174,7 @@ def status_report(final=False):
 def main():
     log("🚀 Cloud Sniper v3 starting")
     load_seen()
+    load_stickers()
     threading.Thread(target=discord_worker, daemon=True).start()
     if ENABLE_SKINPORT:
         register_source("Skinport", fetch_skinport, SKINPORT_REFRESH)
