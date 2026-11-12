@@ -42,7 +42,6 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
     sys.exit(1)
 
-
 # --- loop timing ---
 # RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
@@ -671,26 +670,6 @@ def get_pred_price(listing):
     return pred / 100.0 if pred else None
 
 
-TODAY = {"day": None, "n": 0, "cost": 0.0, "profit": 0.0}
-
-
-def track_alert(listing, item, price):
-    """Adds an alert to today's running totals (alerts, money needed, estimated profit)."""
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if TODAY["day"] != day:
-        TODAY.update(day=day, n=0, cost=0.0, profit=0.0)
-    est = sell_estimate(listing, item, price)
-    TODAY["n"] += 1
-    TODAY["cost"] += price
-    if est:
-        TODAY["profit"] += est[2]
-
-
-def daily_progress():
-    return (f"Today (UTC): {TODAY['n']} alerts · {money(TODAY['cost'])} of {money(DAILY_BUDGET_EUR * EUR_USD)} budget · "
-            f"est. profit {money(TODAY['profit'])} of {money(DAILY_PROFIT_TARGET_EUR * EUR_USD)} goal")
-
-
 def sell_estimate(listing, item, price):
     """(list_price, you_receive_after_fee, profit, ref_value) if sold SELL_UNDERCUT_PCT under the reference price."""
     base = get_base_price(listing)
@@ -882,7 +861,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         "description": "\n".join(desc),
         "color": color,
         "fields": fields,
-        "footer": {"text": f"{daily_progress()} • {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"},
+        "footer": {"text": f"Cloud Sniper v3.1 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
     }
     for f in fields:
         f["value"] = str(f["value"])[:1024] or "?"
@@ -1212,7 +1191,6 @@ def poll_once():
             item = listing.get("item") or {}
             price = price_cents / 100.0
             try:
-                track_alert(listing, item, price)
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
                 enqueue(payload, WEBHOOKS.get(channel) or DISCORD_WEBHOOK,
                         f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}",
@@ -1250,7 +1228,6 @@ def status_report(final=False):
            f"HTTP: {http}\n"
            f"Missed-window events: {STATS['saturated']} · time paused by rate limits: {STATS['blocked_s']:.0f}s · "
            f"undeliverable alerts: {STATS['post_fail']}\n"
-           f"{daily_progress()}\n"
            f"Craft queries: {STATS['craft_polls']} · learned premium sticker ids: {len(STICKER_DB)}\n"
            f"Listings allowance: {LIST_LIM.remaining} of {LIST_LIM.limit} left, resets in "
            f"{max(0, (LIST_LIM.reset_ts or 0) - now):.0f}s · requests this run: {sum(HTTP.values())}\n"
