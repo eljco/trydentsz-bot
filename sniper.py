@@ -42,10 +42,6 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
     sys.exit(1)
 
-# --- daily budget / goal (shown in every alert footer so you can see how the day is going) ---
-EUR_USD = float(os.environ.get("EUR_USD", "1.15"))             # adjust to today's rate
-DAILY_BUDGET_EUR = float(os.environ.get("DAILY_BUDGET_EUR", "150"))
-DAILY_PROFIT_TARGET_EUR = float(os.environ.get("DAILY_PROFIT_TARGET_EUR", "16"))
 
 # --- loop timing ---
 # RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
