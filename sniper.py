@@ -9,6 +9,7 @@ CS2 Sniper v3 - high-throughput edition
 """
 import json
 import os
+import itertools
 import queue
 import signal
 import statistics
@@ -82,11 +83,13 @@ PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
-MAX_SP_BY_COUNT = {1: 5.0, 2: 7.0, 3: 10.0, 4: 14.0}
+# Sticker crafts are harder to sell than plain skins, so only VERY low SP (0-3.3%) is worth an alert.
+STICKER_MAX_SP = 3.3
+MAX_SP_BY_COUNT = {1: STICKER_MAX_SP, 2: STICKER_MAX_SP, 3: STICKER_MAX_SP, 4: STICKER_MAX_SP}
 STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $35
 # Generic craft rule: ANY gun (not only TARGET_WEAPONS) with valuable stickers applied cheaply
 GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0   # $ total sticker value (CSFloat reference prices)
-GENERIC_CRAFT_MAX_SP = 6.0               # % SP
+GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP               # % SP
 
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
@@ -161,7 +164,8 @@ NEAR = []                    # best-looking listings that were rejected: (discou
 SALES_BUDGET = 0
 LAST_ALERT = 0.0
 RUNNING = True
-ALERTQ = queue.Queue()
+ALERTQ = queue.PriorityQueue()   # (priority, seq, job): 0 = plain deals / system, 1 = sticker crafts
+_SEQ = itertools.count()
 _REF_LOGGED = False
 
 
@@ -250,10 +254,8 @@ def _post(payload, webhook):
 def discord_worker():
     global LAST_ALERT
     while True:
-        job = ALERTQ.get()
+        _, _, job = ALERTQ.get()
         try:
-            if job is None:
-                return
             payload, webhook, label = job
             ok = _post(payload, webhook)
             if not ok and label:   # retry with a minimal embed (no fields) so the alert is never lost
@@ -276,9 +278,9 @@ def discord_worker():
             ALERTQ.task_done()
 
 
-def enqueue(payload, webhook, label=None):
+def enqueue(payload, webhook, label=None, prio=0):
     if webhook:
-        ALERTQ.put((payload, webhook, label))
+        ALERTQ.put((prio, next(_SEQ), (payload, webhook, label)))
 
 
 def flush_queue(timeout=60):
@@ -961,6 +963,7 @@ def poll_once():
     now = time.time()
     changed = False
     ordered = sorted(all_listings.values(), key=lambda l: l.get("created_at") or "", reverse=True)
+    ordered.sort(key=lambda l: bool((l.get("item") or {}).get("stickers")))   # stable: plain skins first
     for listing in ordered:
         lid = listing["id"]
         price_cents = listing.get("price") or 0
@@ -1004,7 +1007,8 @@ def poll_once():
             try:
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
                 enqueue(payload, WEBHOOKS.get(channel) or DISCORD_WEBHOOK,
-                        f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}")
+                        f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}",
+                        prio=1 if item.get("stickers") else 0)
             except Exception as e:
                 log("Error building alert:", repr(e))
     if len(RETRIES) > 2000:
