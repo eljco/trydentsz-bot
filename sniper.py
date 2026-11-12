@@ -42,6 +42,11 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     print("Missing DISCORD_WEBHOOK or CSFLOAT_API_KEY environment variables.")
     sys.exit(1)
 
+# --- daily budget / goal (shown in every alert footer so you can see how the day is going) ---
+EUR_USD = float(os.environ.get("EUR_USD", "1.15"))             # adjust to today's rate
+DAILY_BUDGET_EUR = float(os.environ.get("DAILY_BUDGET_EUR", "150"))
+DAILY_PROFIT_TARGET_EUR = float(os.environ.get("DAILY_PROFIT_TARGET_EUR", "16"))
+
 # --- loop timing ---
 # RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
@@ -64,14 +69,13 @@ FAIL_ALERT_AFTER = 0 if BOUNDED else 10
 # (sort, min_price_cents, max_price_cents)
 # Weighted towards the $0-$50 range where the liquid guns live; knives/gloves get one slice up to ~$260.
 FEED_PLAN = [
-    ("best_deal", 0, 400),
-    ("most_recent", 0, 400),
-    ("best_deal", 400, 1500),
-    ("most_recent", 400, 1500),
-    ("best_deal", 1500, 5000),
-    ("most_recent", 1500, 5000),
-    ("best_deal", 0, 5000),
-    ("best_deal", 5000, 26000),
+    ("best_deal", 0, 200),
+    ("most_recent", 0, 200),
+    ("best_deal", 200, 600),
+    ("most_recent", 200, 600),
+    ("best_deal", 600, 1500),
+    ("most_recent", 600, 1500),
+    ("best_deal", 0, 1500),
 ]
 FEED_DISABLED = set()
 FEED_I = 0
@@ -79,7 +83,10 @@ FEED_I = 0
 # The bot LEARNS sticker ids from listings it sees, then every CRAFT_FEED_EVERY-th request asks CSFloat for the
 # CHEAPEST listings carrying one of the top stickers (cheapest skin + expensive sticker = lowest SP).
 # Crafts are rare and hard to sell, so they get a smaller share of requests than before (1 in 5).
-CRAFT_FEED_EVERY = 5
+# Sticker crafts are OFF by default: they tie up lots of money, are hard to sell and flooded the alerts.
+# Set ENABLE_STICKER_ALERTS=true (env) to turn crafts, the craft hunter and "stickers ~free" alerts back on.
+ENABLE_STICKER_ALERTS = os.environ.get("ENABLE_STICKER_ALERTS", "false").lower() == "true"
+CRAFT_FEED_EVERY = 5 if ENABLE_STICKER_ALERTS else 0
 CRAFT_TOP_N = 20                  # how many of the most valuable learned stickers to rotate through
 CRAFT_MIN_STICKER_CENTS = 300     # ignore stickers worth less than $3
 EXTRA_STICKER_IDS = []            # optional: add CSFloat sticker ids you always want checked, e.g. [123, 456]
@@ -91,9 +98,13 @@ MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached 
 
 # --- what to look for ---
 # Liquid weapons. (DEALS_ANY_WEAPON below keeps the general scanner open for every gun anyway.)
-TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil", "desert eagle"]
-MAX_SKIN_PRICE = 50.00
-MIN_SKIN_PRICE = 0.10
+TARGET_WEAPONS = ["ak-47", "m4a4", "m4a1-s", "mac-10", "awp",
+                  "glock", "usp", "desert eagle", "p250", "five-seven", "tec-9", "cz75", "p2000", "dual berettas", "r8 revolver"]
+# Volume strategy: MANY small flips (~40/day at ~0.40 EUR each) instead of a few big ones.
+# 150 EUR budget / 40 buys = ~$4.30 average buy, so the cap is low and cheap skins are the main target.
+MAX_SKIN_PRICE = 15.00
+MIN_SKIN_PRICE = 0.50
+ENABLE_KNIVES_GLOVES = False      # too expensive for the budget; set True to scan them again
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
@@ -117,7 +128,7 @@ FAIR_SLACK = 0.30
 
 # --- general "deal" scanner ---
 ENABLE_DEALS = True
-DEALS_ANY_WEAPON = True
+DEALS_ANY_WEAPON = False         # only TARGET_WEAPONS (AK, M4s, MAC-10, AWP, pistols)
 DEAL_MIN_DISCOUNT = 2.5           # % below float-adjusted reference price (cheap pre-filter, no API call)
 PRED_CAP = 1.00                   # CSFloat's float-adjusted price is NEVER trusted above the base price
                                   # (it over-values extreme floats nobody actually pays for). It can only LOWER the estimate.
@@ -127,6 +138,9 @@ PREMIUM_UNVERIFIED_DISCOUNT = 12.0
 RETRY_MAX = 3                     # polls to wait for sales data before falling back
 
 SELL_FEE = 0.02
+# Nobody pays the full reference price: you realistically list a bit under it. All profit numbers (and the
+# alert thresholds) use this undercut. Set to 0.0 to go back to "sell at full reference price".
+SELL_UNDERCUT_PCT = 1.3
 # How resale value is estimated. The old rule used the LOWER of CSFloat's reference price and the recent
 # sales median, which under-estimates liquid skins you can really sell at/above the reference.
 RESALE_CAPPED_BY_MEDIAN = False   # True = old, pessimistic behaviour
@@ -134,11 +148,11 @@ RESALE_BOOST_PCT = 0.0            # e.g. 2.0 if you routinely sell ~2% above CSF
 MIN_STABILITY = 3
 # Profit targets (USD). Goal ~ $18 (~16 EUR) per day: ~20 buys at ~$0.90 average. "GOOD" is the volume tier,
 # "STRONG" is the ~$0.80+ tier you really want.
-STRONG_MIN_PROFIT = 0.80
-STRONG_MIN_PCT = 4.0
+STRONG_MIN_PROFIT = 0.60
+STRONG_MIN_PCT = 8.0
 STRONG_MIN_STABILITY = 5
-GOOD_MIN_PROFIT = 0.30
-GOOD_MIN_PCT = 2.0
+GOOD_MIN_PROFIT = 0.35
+GOOD_MIN_PCT = 6.0
 SALES_MAX_AGE_DAYS = 30           # only sales this recent count for avg/median/stability (old one-off sales can't fool the check)
 MAX_KNIFE_PRICE = 259.00
 MAX_GLOVE_PRICE = 259.00
@@ -153,12 +167,12 @@ BLUE_SKINS = [
     "atheris", "fever dream", "cortex", "cyrex", "bunsen burner", "glacier mesh", "ice cap",
     "sapphire", "azure", "blue steel", "oceanic", "hydroponic",
 ]
-OUNCETRA_MAX_PRICE = 100.00
+OUNCETRA_MAX_PRICE = 15.00
 OUNCETRA_MIN_DISCOUNT = 0.5
 
-CHEAP_MAX_PRICE = 1.15
-CHEAP_MIN_PROFIT = 0.07
-BREAKEVEN_MIN_PROFIT = 0.20       # "LOW MARGIN" alerts now need at least 20c, no more pure break-even noise
+CHEAP_MAX_PRICE = 1.50
+CHEAP_MIN_PROFIT = 0.15
+BREAKEVEN_MIN_PROFIT = 0.30       # "SMALL PROFIT" tier
 BREAKEVEN_MIN_STABILITY = 4
 
 ENABLE_SKINPORT = True
@@ -661,6 +675,39 @@ def get_pred_price(listing):
     return pred / 100.0 if pred else None
 
 
+TODAY = {"day": None, "n": 0, "cost": 0.0, "profit": 0.0}
+
+
+def track_alert(listing, item, price):
+    """Adds an alert to today's running totals (alerts, money needed, estimated profit)."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if TODAY["day"] != day:
+        TODAY.update(day=day, n=0, cost=0.0, profit=0.0)
+    est = sell_estimate(listing, item, price)
+    TODAY["n"] += 1
+    TODAY["cost"] += price
+    if est:
+        TODAY["profit"] += est[2]
+
+
+def daily_progress():
+    return (f"Today (UTC): {TODAY['n']} alerts · {money(TODAY['cost'])} of {money(DAILY_BUDGET_EUR * EUR_USD)} budget · "
+            f"est. profit {money(TODAY['profit'])} of {money(DAILY_PROFIT_TARGET_EUR * EUR_USD)} goal")
+
+
+def sell_estimate(listing, item, price):
+    """(list_price, you_receive_after_fee, profit, ref_value) if sold SELL_UNDERCUT_PCT under the reference price."""
+    base = get_base_price(listing)
+    if not base:
+        return None
+    pred = get_pred_price(listing)
+    ref = min(pred, base * PRED_CAP) if pred else base
+    ref_eff = ref + charm_bonus(listing, item)
+    sell = ref_eff * (1 - SELL_UNDERCUT_PCT / 100.0)
+    got = sell * (1 - SELL_FEE)
+    return sell, got, got - price, ref_eff
+
+
 def fair_price_ok(listing, price):
     base = get_base_price(listing)
     if base is None:
@@ -761,6 +808,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         r = float_val / sales["avg_float"] if sales["avg_float"] else 1
         float_q = "🟢 Float Excellent" if r < 0.75 else ("🟡 Float Average" if r < 1.25 else "🔴 Float High")
 
+    est = sell_estimate(listing, item, price)
     head = verdict or "📌 ALERT"
     desc = [f"**{head}**"]
     line2 = []
@@ -770,6 +818,10 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         line2.append(float_q)
     if line2:
         desc.append(" · ".join(line2))
+    if est:
+        sell_p, got, prof, _ = est
+        desc.append(f"💵 Sell ~{money(sell_p)} ({SELL_UNDERCUT_PCT:g}% under) → you get **{money(got)}** "
+                    f"after {SELL_FEE * 100:g}% fee → **{money(prof)}** profit ({prof / price * 100:+.1f}%)")
     desc.append(f"\n📌 **Trigger:** {trigger_text}")
 
     fields = [
@@ -780,6 +832,14 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         {"name": "🌱 Seed", "value": f"`{seed}`" if seed is not None else "?", "inline": True},
         {"name": "👤 Seller", "value": seller_txt, "inline": True},
     ]
+    if est:
+        sell_p, got, prof, ref_v = est
+        stick_note = "\n_Skin value only, stickers not counted._" if item.get("stickers") else ""
+        fields.append({"name": "💵 If you sell it", "value":
+                       f"Reference: {money(ref_v)}\nList at {money(sell_p)} ({SELL_UNDERCUT_PCT:g}% under)\n"
+                       f"You get: **{money(got)}** after {SELL_FEE * 100:g}% fee\n"
+                       f"Profit: **{money(prof)}** ({prof / price * 100:+.1f}%)" + stick_note,
+                       "inline": False})
     if pred:
         note = f"\n⚠️ +{(pred / base - 1) * 100:.0f}% vs base - ignored" if base and pred > base * 1.05 else ""
         fields.append({"name": "🎯 CSFloat float est.", "value": money(pred) + note, "inline": True})
@@ -826,7 +886,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         "description": "\n".join(desc),
         "color": color,
         "fields": fields,
-        "footer": {"text": f"Cloud Sniper v3.1 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
+        "footer": {"text": f"{daily_progress()} • {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"},
     }
     for f in fields:
         f["value"] = str(f["value"])[:1024] or "?"
@@ -854,6 +914,9 @@ def evaluate(listing):
     cat = item_category(name_orig)
     if EXCLUDE_SOUVENIRS and is_souvenir(name, item):
         rej("souvenir (excluded)")
+        return None
+    if not ENABLE_STICKER_ALERTS and item.get("stickers"):
+        rej("stickered item (sticker alerts off)")
         return None
 
     # 1. rare charm pattern
@@ -920,6 +983,9 @@ def evaluate(listing):
 
     # 5. deal vs market
     premium = cat in ("knives", "gloves")
+    if premium and not ENABLE_KNIVES_GLOVES:
+        rej("knife/glove (disabled)")
+        return None
     max_price = {"knives": MAX_KNIFE_PRICE, "gloves": MAX_GLOVE_PRICE}.get(cat, MAX_SKIN_PRICE)
     if not ENABLE_DEALS or charm_item or not (DEALS_ANY_WEAPON or is_target or premium):
         return None
@@ -946,7 +1012,7 @@ def evaluate(listing):
     if disc < DEAL_MIN_DISCOUNT:
         rej("below reference < %.1f%%" % DEAL_MIN_DISCOUNT)
         return None
-    net_fast = ref_eff * (1 - SELL_FEE) - price
+    net_fast = ref_eff * (1 - SELL_UNDERCUT_PCT / 100.0) * (1 - SELL_FEE) - price
     if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
         rej("no edge after fees (pre-check)")
         return None
@@ -992,10 +1058,10 @@ def evaluate(listing):
         rej("recent sales median below listing price")
         return None
     resale = (min(ref, s["median"]) if RESALE_CAPPED_BY_MEDIAN else ref) * (1 + RESALE_BOOST_PCT / 100.0) + bonus
-    net = resale * (1 - SELL_FEE) - price
+    net = resale * (1 - SELL_UNDERCUT_PCT / 100.0) * (1 - SELL_FEE) - price
     net_pct = net / price * 100
-    trig = (f"Est. net profit after fees: {money(net)} ({net_pct:+.0f}%) "
-            f"| resale est. {money(resale)} (recent median {money(s['median'])}) | {disc:.0f}% below market{charm_note}")
+    trig = (f"Est. net profit after {SELL_UNDERCUT_PCT:g}% undercut + {SELL_FEE * 100:g}% fee: {money(net)} ({net_pct:+.0f}%) "
+            f"| resale est. {money(resale * (1 - SELL_UNDERCUT_PCT / 100.0))} (recent median {money(s['median'])}) | {disc:.0f}% below market{charm_note}")
     if premium:
         if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
                 and s["stability"] >= STRONG_MIN_STABILITY:
@@ -1006,7 +1072,7 @@ def evaluate(listing):
         return None
     if cheap:
         if net >= CHEAP_MIN_PROFIT:
-            return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
+            return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item)", "cheap")
         rej("cheap profit too low")
         return None
     if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT and s["stability"] >= STRONG_MIN_STABILITY:
@@ -1150,6 +1216,7 @@ def poll_once():
             item = listing.get("item") or {}
             price = price_cents / 100.0
             try:
+                track_alert(listing, item, price)
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
                 enqueue(payload, WEBHOOKS.get(channel) or DISCORD_WEBHOOK,
                         f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}",
@@ -1187,6 +1254,7 @@ def status_report(final=False):
            f"HTTP: {http}\n"
            f"Missed-window events: {STATS['saturated']} · time paused by rate limits: {STATS['blocked_s']:.0f}s · "
            f"undeliverable alerts: {STATS['post_fail']}\n"
+           f"{daily_progress()}\n"
            f"Craft queries: {STATS['craft_polls']} · learned premium sticker ids: {len(STICKER_DB)}\n"
            f"Listings allowance: {LIST_LIM.remaining} of {LIST_LIM.limit} left, resets in "
            f"{max(0, (LIST_LIM.reset_ts or 0) - now):.0f}s · requests this run: {sum(HTTP.values())}\n"
