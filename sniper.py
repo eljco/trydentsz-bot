@@ -1,11 +1,13 @@
 """
-CS2 Sniper v3 - high-throughput edition
+CS2 Sniper v3.1 - high-throughput edition
 - Adaptive rate limiting (reads CSFloat's x-ratelimit headers, backs off on 429, speeds back up)
 - Several price-sliced "newest" feeds + a "best_deal" feed, extra pages when the market is busy
 - Float-aware pre-filter using CSFloat's own reference price -> far fewer sales-history calls
 - Unverified alerts instead of silently dropping listings when sales data is rate limited
 - Discord posting runs in a background thread so alerts never slow down scanning
 - Optional status channel (DISCORD_WEBHOOK_STATUS) that shows exactly why listings did / didn't alert
+v3.1: listings up to 2h old are checked on every feed, guns up to $50, volume-oriented profit thresholds,
+      deagle added, only sales from the last 30 days count for the profit check.
 """
 import json
 import os
@@ -45,7 +47,9 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
 BOUNDED = RUN_SECONDS > 0
 POLL_INTERVAL = 0.5            # target seconds per full cycle; the rate limiter slows this down if needed
-MAX_LISTING_AGE = 10 * 60 * 60
+# Listings older than this are ignored (checked on every feed except the sticker-craft feed).
+# 2 hours: catches deals that were missed or that the best_deal feed keeps surfacing.
+MAX_LISTING_AGE = int(os.environ.get("MAX_LISTING_AGE_HOURS", "2")) * 60 * 60
 
 # Status reports (why things did/didn't alert). Always-on: hourly to status channel (or every 6h to main).
 # Actions mode: one report at the end of each run, only if a status webhook is set.
@@ -54,27 +58,28 @@ STATUS_EVERY_MIN = 60 if STATUS_HOOK_ENV else 360
 FAIL_ALERT_AFTER = 0 if BOUNDED else 10
 
 # --- feeds ---
-# (min_price_cents, max_price_cents, max_pages). Extra pages are only fetched when the whole page was new
-# (= the market moved faster than we poll). Knives/gloves go up to ~$260.
 # ONE request per poll, rotating through this plan. The limiter spreads requests evenly over CSFloat's
 # rate-limit window, so we never burn the allowance. "best_deal" keeps showing already-discounted listings
 # until they sell, so it finds deals with far fewer requests than "most_recent".
 # (sort, min_price_cents, max_price_cents)
+# Weighted towards the $0-$50 range where the liquid guns live; knives/gloves get one slice up to ~$260.
 FEED_PLAN = [
     ("best_deal", 0, 400),
     ("most_recent", 0, 400),
     ("best_deal", 400, 1500),
     ("most_recent", 400, 1500),
-    ("best_deal", 1500, 6000),
-    ("best_deal", 6000, 26000),
-    ("most_recent", 1500, 26000),
+    ("best_deal", 1500, 5000),
+    ("most_recent", 1500, 5000),
+    ("best_deal", 0, 5000),
+    ("best_deal", 5000, 26000),
 ]
 FEED_DISABLED = set()
 FEED_I = 0
 # --- craft hunter: dedicated queries for listings carrying the most valuable premium stickers ---
 # The bot LEARNS sticker ids from listings it sees, then every CRAFT_FEED_EVERY-th request asks CSFloat for the
 # CHEAPEST listings carrying one of the top stickers (cheapest skin + expensive sticker = lowest SP).
-CRAFT_FEED_EVERY = 3
+# Crafts are rare and hard to sell, so they get a smaller share of requests than before (1 in 5).
+CRAFT_FEED_EVERY = 5
 CRAFT_TOP_N = 20                  # how many of the most valuable learned stickers to rotate through
 CRAFT_MIN_STICKER_CENTS = 300     # ignore stickers worth less than $3
 EXTRA_STICKER_IDS = []            # optional: add CSFloat sticker ids you always want checked, e.g. [123, 456]
@@ -85,8 +90,9 @@ STICKER_ITEM_MIN_DISCOUNT = 5.0   # stickered item priced this far under the CLE
 MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached per skin for 15 min)
 
 # --- what to look for ---
-TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
-MAX_SKIN_PRICE = 35.00
+# Liquid weapons. (DEALS_ANY_WEAPON below keeps the general scanner open for every gun anyway.)
+TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil", "desert eagle"]
+MAX_SKIN_PRICE = 50.00
 MIN_SKIN_PRICE = 0.10
 
 PREMIUM_STICKERS = [
@@ -96,7 +102,7 @@ PREMIUM_STICKERS = [
 # Sticker crafts are harder to sell than plain skins, so only VERY low SP (0-3.3%) is worth an alert.
 STICKER_MAX_SP = 3.3
 MAX_SP_BY_COUNT = {1: STICKER_MAX_SP, 2: STICKER_MAX_SP, 3: STICKER_MAX_SP, 4: STICKER_MAX_SP}
-STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $35
+STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $50
 # Generic craft rule: ANY gun (not only TARGET_WEAPONS) with valuable stickers applied cheaply
 GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0   # $ total sticker value (CSFloat reference prices)
 GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP               # % SP
@@ -112,11 +118,11 @@ FAIR_SLACK = 0.30
 # --- general "deal" scanner ---
 ENABLE_DEALS = True
 DEALS_ANY_WEAPON = True
-DEAL_MIN_DISCOUNT = 3.0           # % below float-adjusted reference price (cheap pre-filter, no API call)
+DEAL_MIN_DISCOUNT = 2.5           # % below float-adjusted reference price (cheap pre-filter, no API call)
 PRED_CAP = 1.00                   # CSFloat's float-adjusted price is NEVER trusted above the base price
                                   # (it over-values extreme floats nobody actually pays for). It can only LOWER the estimate.
 DEAL_MIN_SALES = 3
-DEAL_UNVERIFIED_DISCOUNT = 8.0    # sales data unavailable -> still alert at this % below reference
+DEAL_UNVERIFIED_DISCOUNT = 7.0    # sales data unavailable -> still alert at this % below reference
 PREMIUM_UNVERIFIED_DISCOUNT = 12.0
 RETRY_MAX = 3                     # polls to wait for sales data before falling back
 
@@ -126,11 +132,14 @@ SELL_FEE = 0.02
 RESALE_CAPPED_BY_MEDIAN = False   # True = old, pessimistic behaviour
 RESALE_BOOST_PCT = 0.0            # e.g. 2.0 if you routinely sell ~2% above CSFloat's reference price
 MIN_STABILITY = 3
-STRONG_MIN_PROFIT = 0.75
-STRONG_MIN_PCT = 6.0
+# Profit targets (USD). Goal ~ $18 (~16 EUR) per day: ~20 buys at ~$0.90 average. "GOOD" is the volume tier,
+# "STRONG" is the ~$0.80+ tier you really want.
+STRONG_MIN_PROFIT = 0.80
+STRONG_MIN_PCT = 4.0
 STRONG_MIN_STABILITY = 5
-GOOD_MIN_PROFIT = 0.15
-GOOD_MIN_PCT = 2.5
+GOOD_MIN_PROFIT = 0.30
+GOOD_MIN_PCT = 2.0
+SALES_MAX_AGE_DAYS = 30           # only sales this recent count for avg/median/stability (old one-off sales can't fool the check)
 MAX_KNIFE_PRICE = 259.00
 MAX_GLOVE_PRICE = 259.00
 PREMIUM_MIN_SALES = 3
@@ -149,7 +158,7 @@ OUNCETRA_MIN_DISCOUNT = 0.5
 
 CHEAP_MAX_PRICE = 1.15
 CHEAP_MIN_PROFIT = 0.07
-BREAKEVEN_MIN_PROFIT = 0.0
+BREAKEVEN_MIN_PROFIT = 0.20       # "LOW MARGIN" alerts now need at least 20c, no more pure break-even noise
 BREAKEVEN_MIN_STABILITY = 4
 
 ENABLE_SKINPORT = True
@@ -385,7 +394,7 @@ def fetch_skinport():
     r = session.get(
         "https://api.skinport.com/v1/items",
         params={"app_id": 730, "currency": "USD"},
-        headers={"Accept-Encoding": "br, gzip", "User-Agent": "trydentsz-sniper/3.0"},
+        headers={"Accept-Encoding": "br, gzip", "User-Agent": "trydentsz-sniper/3.1"},
         timeout=40,
     )
     r.raise_for_status()
@@ -510,7 +519,7 @@ def api_get(path, params, lim, max_wait):
         f"{CSFLOAT}{path}",
         params=params,
         headers={"Authorization": CSFLOAT_API_KEY,
-                 "User-Agent": "trydentsz-sniper/3.0",
+                 "User-Agent": "trydentsz-sniper/3.1",
                  "Accept": "application/json"},
         timeout=15,
     )
@@ -548,11 +557,27 @@ def get_sales(name, budgeted=True):
     return sales
 
 
+def _sale_is_recent(s):
+    """True if the sale is within SALES_MAX_AGE_DAYS (sales without a parsable date are kept)."""
+    if not SALES_MAX_AGE_DAYS:
+        return True
+    created = s.get("created_at")
+    if not created:
+        return True
+    try:
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= SALES_MAX_AGE_DAYS * 86400
+    except Exception:
+        return True
+
+
 def summarize_sales(sales):
     clean = []
     for s in sales or []:
         item = s.get("item") or {}
         if item.get("stickers") or not s.get("price"):
+            continue
+        if not _sale_is_recent(s):
             continue
         clean.append(s)
     clean.sort(key=lambda s: s.get("created_at") or "", reverse=True)
@@ -801,7 +826,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         "description": "\n".join(desc),
         "color": color,
         "fields": fields,
-        "footer": {"text": f"Cloud Sniper v3 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
+        "footer": {"text": f"Cloud Sniper v3.1 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
     }
     for f in fields:
         f["value"] = str(f["value"])[:1024] or "?"
@@ -919,7 +944,7 @@ def evaluate(listing):
     charm_note = f" | incl. {money(bonus)} charm bonus" if bonus > 0 else ""
     cheap = price <= CHEAP_MAX_PRICE and not premium
     if disc < DEAL_MIN_DISCOUNT:
-        rej("below reference < %.0f%%" % DEAL_MIN_DISCOUNT)
+        rej("below reference < %.1f%%" % DEAL_MIN_DISCOUNT)
         return None
     net_fast = ref_eff * (1 - SELL_FEE) - price
     if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
@@ -957,7 +982,7 @@ def evaluate(listing):
     s = summarize_sales(sales)
     min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
     if not s or s["n"] < min_sales:
-        rej("too few sales")
+        rej("too few recent sales")
         return None
     if s["stability"] < MIN_STABILITY:
         rej("too volatile")
@@ -989,7 +1014,7 @@ def evaluate(listing):
     if net >= GOOD_MIN_PROFIT and net_pct >= GOOD_MIN_PCT:
         return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
     if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
-        return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / SMALL PROFIT", "main")
+        return ("LOW MARGIN", trig, 9807270, "⚖️ SMALL PROFIT", "main")
     rej("profit too low")
     return None
 
@@ -1088,7 +1113,8 @@ def poll_once():
         price_cents = listing.get("price") or 0
         if is_seen(lid, price_cents):
             continue
-        if listing.get("_feed") == "most_recent" and not is_fresh(listing):
+        # Age filter on every feed except the sticker-craft hunter (stale listings are not worth a sales lookup)
+        if listing.get("_feed") != "craft" and not is_fresh(listing):
             SEEN[lid] = [now, price_cents]
             changed = True
             continue
@@ -1172,7 +1198,7 @@ def status_report(final=False):
 
 # ================= MAIN LOOP =================
 def main():
-    log("🚀 Cloud Sniper v3 starting")
+    log("🚀 Cloud Sniper v3.1 starting")
     load_seen()
     load_stickers()
     threading.Thread(target=discord_worker, daemon=True).start()
