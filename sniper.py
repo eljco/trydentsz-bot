@@ -59,7 +59,7 @@ RECENT_SLICES = [(0, 150, 3), (150, 500, 2), (500, 1500, 2), (1500, 3500, 1), (3
 # "best_deal" feed catches listings that are already heavily discounted, even if we missed them when new.
 DEAL_SLICES = [(0, 1500), (1500, 26000)]
 DEAL_FEED_EVERY = 3          # run the best_deal feeds every Nth cycle (0 = off)
-MAX_SALES_CALLS_PER_POLL = 10  # cap on sales-history lookups per cycle (cached per skin for 15 min)
+MAX_SALES_CALLS_PER_POLL = 12  # cap on sales-history lookups per cycle (cached per skin for 15 min)
 
 # --- what to look for ---
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
@@ -112,7 +112,7 @@ BLUE_SKINS = [
     "sapphire", "azure", "blue steel", "oceanic", "hydroponic",
 ]
 OUNCETRA_MAX_PRICE = 100.00
-OUNCETRA_MIN_DISCOUNT = 3.0
+OUNCETRA_MIN_DISCOUNT = 0.5
 
 CHEAP_MAX_PRICE = 1.15
 CHEAP_MIN_PROFIT = 0.07
@@ -143,12 +143,21 @@ PRICE_SOURCES = {}
 REJ = Counter()
 HTTP = Counter()
 RETRIES = {}
-STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0}
+STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0, "saturated": 0, "post_fail": 0, "blocked_s": 0}
+LAST_REJ = None
+NEAR = []                    # best-looking listings that were rejected: (discount, name, price, reason, id)
 SALES_BUDGET = 0
 LAST_ALERT = 0.0
 RUNNING = True
 ALERTQ = queue.Queue()
 _REF_LOGGED = False
+
+
+def rej(reason):
+    """Count a rejection and remember the reason (used for the near-miss report)."""
+    global LAST_REJ
+    REJ[reason] += 1
+    LAST_REJ = reason
 
 
 def log(*a):
@@ -234,7 +243,18 @@ def discord_worker():
             if job is None:
                 return
             payload, webhook, label = job
-            if _post(payload, webhook):
+            ok = _post(payload, webhook)
+            if not ok and label:   # retry with a minimal embed (no fields) so the alert is never lost
+                emb = (payload.get("embeds") or [{}])[0]
+                mini = {"username": payload.get("username"), "embeds": [{k: v for k, v in {
+                    "title": (emb.get("title") or "Alert")[:250], "url": emb.get("url"),
+                    "description": (emb.get("description") or "")[:1500], "color": emb.get("color")}.items()
+                    if v is not None}]}
+                ok = _post(mini, webhook)
+            if not ok and label:
+                STATS["post_fail"] += 1
+                log(f"!! ALERT COULD NOT BE DELIVERED: {label}")
+            if ok:
                 if label:
                     STATS["alerts"] += 1
                     LAST_ALERT = time.time()
@@ -374,6 +394,7 @@ class Limiter:
             if ra is None and self.reset_ts and self.reset_ts > now:
                 ra = self.reset_ts - now
             self.blocked_until = now + min(ra or 30, 300)
+            STATS["blocked_s"] += min(ra or 30, 300)
             self.gap = min(self.gap * 1.5, 5.0)
             self.streak = 0
             log(f"[{self.name}] 429 - paused {min(ra or 30, 300):.0f}s, gap now {self.gap:.2f}s")
@@ -549,9 +570,7 @@ def compute_sp(listing, item):
 
 
 def is_standalone_charm(name, item=None):
-    if name.startswith("charm |"):
-        return True
-    return bool(item) and item.get("keychain_pattern") is not None
+    return name.startswith("charm |")   # guns WITH a charm attached are still normal guns
 
 
 def get_charm_pattern(item):
@@ -679,6 +698,9 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         "fields": fields,
         "footer": {"text": f"Cloud Sniper v3 • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
     }
+    for f in fields:
+        f["value"] = str(f["value"])[:1024] or "?"
+    embed = {k: v for k, v in embed.items() if v is not None}
     icon = item.get("icon_url")
     if icon:
         embed["thumbnail"] = {"url": f"https://community.cloudflare.steamstatic.com/economy/image/{icon}/360fx360f"}
@@ -715,13 +737,13 @@ def evaluate(listing):
             n_st = len(matched)
             limit = MAX_SP_BY_COUNT.get(min(n_st, max(MAX_SP_BY_COUNT)))
             if sp is None:
-                REJ["craft: SP not computable"] += 1
+                rej("craft: SP not computable")
             elif sp <= limit:
                 return (f"PREMIUM STICKER CRAFT ({n_st}x)",
                         f"{sp:.1f}% SP (limit {limit:.1f}%) | Stickers: {', '.join(matched)}",
                         16711680, f"🏷️ {n_st}x STICKER CRAFT")
             else:
-                REJ["craft: SP too high"] += 1
+                rej("craft: SP too high")
         sv = sticker_value(item)
         if sp is not None and sv >= GENERIC_CRAFT_MIN_STICKER_VALUE and sp <= GENERIC_CRAFT_MAX_SP:
             names = ", ".join(s.get("name", "?") for s in item.get("stickers") or [])
@@ -750,9 +772,18 @@ def evaluate(listing):
     if cat == "gun" and is_blue_skin(name) and not is_souvenir(name, item) \
             and not item.get("stickers") and not charm_item and MIN_SKIN_PRICE <= price <= OUNCETRA_MAX_PRICE:
         b = get_base_price(listing)
-        if b and (b - price) / b * 100 >= OUNCETRA_MIN_DISCOUNT:
-            return ("BLUE SKIN", f"{(b - price) / b * 100:.0f}% below market ({money(b)})",
-                    3447003, "💙 BLUE SKIN DEAL", "ouncetra")
+        if b:
+            pr = get_pred_price(listing)
+            d = (b - price) / b * 100
+            if pr:
+                r2 = min(pr, b * PRED_CAP)
+                d = max(d, (r2 - price) / r2 * 100)
+            if d >= OUNCETRA_MIN_DISCOUNT:
+                return ("BLUE SKIN", f"{d:.1f}% below market ({money(b)})",
+                        3447003, "💙 BLUE SKIN DEAL", "ouncetra")
+            rej("blue skin: not below market enough")
+        else:
+            rej("blue skin: no base price")
 
     # 5. deal vs market
     premium = cat in ("knives", "gloves")
@@ -760,27 +791,27 @@ def evaluate(listing):
     if not ENABLE_DEALS or charm_item or not (DEALS_ANY_WEAPON or is_target or premium):
         return None
     if not (MIN_SKIN_PRICE <= price <= max_price):
-        REJ["price out of range"] += 1
+        rej("price out of range")
         return None
     if item.get("stickers"):
-        REJ["has stickers (not a craft)"] += 1
+        rej("has stickers (not a craft)")
         return None
     if premium and any(k in name for k in PATTERN_DEPENDENT):
         return None
     base = get_base_price(listing)
     if not base:
-        REJ["no base price"] += 1
+        rej("no base price")
         return None
     pred = get_pred_price(listing)
     ref = min(pred, base * PRED_CAP) if pred else base   # float-adjusted reference
     disc = (ref - price) / ref * 100
     cheap = price <= CHEAP_MAX_PRICE and not premium
     if disc < DEAL_MIN_DISCOUNT:
-        REJ["below reference < %.0f%%" % DEAL_MIN_DISCOUNT] += 1
+        rej("below reference < %.0f%%" % DEAL_MIN_DISCOUNT)
         return None
     net_fast = ref * (1 - SELL_FEE) - price
     if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
-        REJ["no edge after fees (pre-check)"] += 1
+        rej("no edge after fees (pre-check)")
         return None
 
     channel_fallback = "cheap" if cheap else (cat if premium else "main")
@@ -790,14 +821,23 @@ def evaluate(listing):
         if disc >= need:
             return ("DEAL (UNVERIFIED)", f"{disc:.0f}% below float-adjusted market - sales data unavailable",
                     16766720, "⚠️ UNVERIFIED DEAL", channel_fallback)
-        return "RETRY"
+        if RETRIES.get(listing.get("id"), 0) < RETRY_MAX - 1:
+            return "RETRY"
+        need_profit = CHEAP_MIN_PROFIT if cheap else (PREMIUM_GOOD_PROFIT if premium else GOOD_MIN_PROFIT)
+        if net_fast >= need_profit and net_fast / price * 100 >= GOOD_MIN_PCT:
+            return ("DEAL (REFERENCE ONLY)",
+                    f"Est. profit after fees {money(net_fast)} ({net_fast / price * 100:+.0f}%) vs CSFloat "
+                    f"reference {money(ref)} | {disc:.0f}% below - no sales data, verify before buying",
+                    16766720, "⚠️ UNVERIFIED DEAL (reference only)", channel_fallback)
+        rej("no sales data + small edge")
+        return None
     s = summarize_sales(sales)
     min_sales = PREMIUM_MIN_SALES if premium else DEAL_MIN_SALES
     if not s or s["n"] < min_sales:
-        REJ["too few sales"] += 1
+        rej("too few sales")
         return None
     if s["stability"] < MIN_STABILITY:
-        REJ["too volatile"] += 1
+        rej("too volatile")
         return None
 
     resale = min(ref, s["median"])
@@ -811,12 +851,12 @@ def evaluate(listing):
             return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", cat)
         if net >= PREMIUM_GOOD_PROFIT and net_pct >= GOOD_MIN_PCT:
             return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", cat)
-        REJ["premium profit too low"] += 1
+        rej("premium profit too low")
         return None
     if cheap:
         if net >= CHEAP_MIN_PROFIT:
             return ("GOOD DEAL", trig, 16766720, "👍 NICE DEAL (cheap item, 7¢+ profit)", "cheap")
-        REJ["cheap profit too low"] += 1
+        rej("cheap profit too low")
         return None
     if net >= STRONG_MIN_PROFIT and net_pct >= STRONG_MIN_PCT and s["stability"] >= STRONG_MIN_STABILITY:
         return ("GREAT DEAL", trig, 5763719, "⭐ STRONG BUY", "main")
@@ -824,7 +864,7 @@ def evaluate(listing):
         return ("GOOD DEAL", trig, 16766720, "👍 GOOD DEAL", "main")
     if net >= BREAKEVEN_MIN_PROFIT and s["stability"] >= BREAKEVEN_MIN_STABILITY:
         return ("LOW MARGIN", trig, 9807270, "⚖️ BREAK-EVEN / SMALL PROFIT", "main")
-    REJ["profit too low"] += 1
+    rej("profit too low")
     return None
 
 
@@ -873,11 +913,13 @@ def fetch_feed(sort, lo, hi, pages=1):
         new = sum(1 for l in batch if l.get("id") and not is_seen(l["id"], l.get("price")))
         if len(batch) < 50 or new < len(batch) * 0.8:
             break   # we've caught up; no need for older pages
+        if page == pages - 1:
+            STATS["saturated"] += 1   # still all-new on the last page -> market moved faster than we scan
     return out, None
 
 
 def poll_once():
-    global SALES_BUDGET
+    global SALES_BUDGET, LAST_REJ
     SALES_BUDGET = MAX_SALES_CALLS_PER_POLL
     feeds = [("most_recent", lo, hi, pg) for lo, hi, pg in RECENT_SLICES]
     if DEAL_FEED_EVERY and STATS["polls"] % DEAL_FEED_EVERY == 0:
@@ -918,6 +960,7 @@ def poll_once():
             changed = True
             continue
         STATS["listings"] += 1
+        LAST_REJ = None
         try:
             hit = evaluate(listing)
         except Exception as e:
@@ -926,10 +969,20 @@ def poll_once():
         if hit == "RETRY":
             RETRIES[lid] = RETRIES.get(lid, 0) + 1
             if RETRIES[lid] < RETRY_MAX:
-                REJ["retry later (sales unavailable)"] += 1
+                rej("retry later (sales unavailable)")
                 continue
             hit = None
         RETRIES.pop(lid, None)
+        if not hit and LAST_REJ and price_cents <= 26000:
+            b, pr = get_base_price(listing), get_pred_price(listing)
+            r_ = (min(pr, b * PRED_CAP) if (pr and b) else b)
+            if r_ and (r_ - price_cents / 100.0) / r_ * 100 >= 5:
+                NEAR.append(((r_ - price_cents / 100.0) / r_ * 100,
+                             (listing.get("item") or {}).get("market_hash_name"), price_cents / 100.0,
+                             LAST_REJ, lid))
+                if len(NEAR) > 60:
+                    NEAR.sort(reverse=True)
+                    del NEAR[15:]
         SEEN[lid] = [now, price_cents]
         changed = True
         if hit:
@@ -952,19 +1005,32 @@ def poll_once():
 
 # ================= STATUS =================
 def status_report(final=False):
-    if not STATUS_HOOK:
+    total_req = sum(HTTP.values()) or 1
+    bad = HTTP[429] + HTTP[403] + HTTP[503] + HTTP[502]
+    unhealthy = STATS["polls"] > 0 and (STATS["errors"] / STATS["polls"] > 0.3 or bad / total_req > 0.2
+                                        or STATS["listings"] < 30)
+    hook = STATUS_HOOK or (DISCORD_WEBHOOK if unhealthy else "")
+    if not hook:
         return
     now = time.time()
     last = f"{(now - LAST_ALERT) / 60:.0f} min ago" if LAST_ALERT else "none yet"
     top = "\n".join(f"• {k}: {v}" for k, v in REJ.most_common(8)) or "-"
     http = ", ".join(f"{k}: {v}" for k, v in sorted(HTTP.items())) or "-"
-    txt = (f"💓 **Sniper status** ({'run finished' if final else 'alive'})\n"
+    NEAR.sort(reverse=True)
+    near = "\n".join(f"• {d:.0f}% under ref · {n} · {money(p)} · rejected: {why} · "
+                     f"[open](https://csfloat.com/item/{i})" for d, n, p, why, i in NEAR[:5]) or "-"
+    NEAR.clear()
+    txt = (f"{'⚠️ **UNHEALTHY** ' if unhealthy else ''}💓 **Sniper status** "
+           f"({'run finished' if final else 'alive'})\n"
            f"Polls: {STATS['polls']} · new listings checked: {STATS['listings']} · "
            f"alerts: {STATS['alerts']} · last alert: {last}\n"
            f"HTTP: {http}\n"
+           f"Missed-window events: {STATS['saturated']} · time paused by rate limits: {STATS['blocked_s']:.0f}s · "
+           f"undeliverable alerts: {STATS['post_fail']}\n"
            f"Listings limiter: limit {LIST_LIM.limit} / remaining {LIST_LIM.remaining} / gap {LIST_LIM.gap:.2f}s\n"
-           f"**Why listings did NOT alert:**\n{top}")
-    simple_message(txt, 3447003, STATUS_HOOK)
+           f"**Why listings did NOT alert:**\n{top}\n"
+           f"**Best listings that were rejected (5%+ under ref):**\n{near}")
+    simple_message(txt[:4000], 15158332 if unhealthy else 3447003, hook)
     REJ.clear()
 
 
