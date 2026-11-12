@@ -43,7 +43,7 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
 # RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
 BOUNDED = RUN_SECONDS > 0
-POLL_INTERVAL = 3            # target seconds per full cycle; the rate limiter slows this down if needed
+POLL_INTERVAL = 0.5            # target seconds per full cycle; the rate limiter slows this down if needed
 MAX_LISTING_AGE = 10 * 60 * 60
 
 # Status reports (why things did/didn't alert). Always-on: hourly to status channel (or every 6h to main).
@@ -55,11 +55,23 @@ FAIL_ALERT_AFTER = 0 if BOUNDED else 10
 # --- feeds ---
 # (min_price_cents, max_price_cents, max_pages). Extra pages are only fetched when the whole page was new
 # (= the market moved faster than we poll). Knives/gloves go up to ~$260.
-RECENT_SLICES = [(0, 150, 3), (150, 500, 2), (500, 1500, 2), (1500, 3500, 1), (3500, 26000, 1)]
-# "best_deal" feed catches listings that are already heavily discounted, even if we missed them when new.
-DEAL_SLICES = [(0, 1500), (1500, 26000)]
-DEAL_FEED_EVERY = 3          # run the best_deal feeds every Nth cycle (0 = off)
-MAX_SALES_CALLS_PER_POLL = 12  # cap on sales-history lookups per cycle (cached per skin for 15 min)
+# ONE request per poll, rotating through this plan. The limiter spreads requests evenly over CSFloat's
+# rate-limit window, so we never burn the allowance. "best_deal" keeps showing already-discounted listings
+# until they sell, so it finds deals with far fewer requests than "most_recent".
+# (sort, min_price_cents, max_price_cents)
+FEED_PLAN = [
+    ("best_deal", 0, 400),
+    ("most_recent", 0, 400),
+    ("best_deal", 400, 1500),
+    ("most_recent", 400, 1500),
+    ("best_deal", 1500, 6000),
+    ("best_deal", 6000, 26000),
+    ("most_recent", 1500, 26000),
+]
+FEED_DISABLED = set()
+FEED_I = 0
+STICKER_ITEM_MIN_DISCOUNT = 5.0   # stickered item priced this far under the CLEAN skin price = stickers ~free
+MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached per skin for 15 min)
 
 # --- what to look for ---
 TARGET_WEAPONS = ["awp", "m4a4", "m4a1-s", "glock", "usp", "ak-47", "mac-10", "galil"]
@@ -373,8 +385,13 @@ class Limiter:
     def wait_needed(self):
         now = time.time()
         w = max(self.blocked_until - now, self.last + self.gap - now, 0.0)
-        if self.remaining is not None and self.remaining <= 1 and self.reset_ts and self.reset_ts > now:
-            w = max(w, min(self.reset_ts - now, 120))
+        if self.remaining is not None and self.reset_ts and self.reset_ts > now:
+            window = self.reset_ts - now
+            avail = self.remaining - 3            # keep a small reserve
+            if avail <= 0:
+                w = max(w, window)                # allowance used up -> wait for the reset
+            else:
+                w = max(w, self.last + window / avail - now)   # spread what is left evenly
         return w
 
     def update(self, r):
@@ -393,11 +410,11 @@ class Limiter:
             ra = _hnum(h, "retry-after")
             if ra is None and self.reset_ts and self.reset_ts > now:
                 ra = self.reset_ts - now
-            self.blocked_until = now + min(ra or 30, 300)
-            STATS["blocked_s"] += min(ra or 30, 300)
+            self.blocked_until = now + min(ra or 30, 3700)
+            STATS["blocked_s"] += min(ra or 30, 3700)
             self.gap = min(self.gap * 1.5, 5.0)
             self.streak = 0
-            log(f"[{self.name}] 429 - paused {min(ra or 30, 300):.0f}s, gap now {self.gap:.2f}s")
+            log(f"[{self.name}] 429 - paused {min(ra or 30, 3700):.0f}s")
         else:
             self.streak += 1
             if self.streak >= 40 and self.gap > self.base_gap:
@@ -794,8 +811,9 @@ def evaluate(listing):
         rej("price out of range")
         return None
     if item.get("stickers"):
-        rej("has stickers (not a craft)")
-        return None
+        has_st = True
+    else:
+        has_st = False
     if premium and any(k in name for k in PATTERN_DEPENDENT):
         return None
     base = get_base_price(listing)
@@ -815,6 +833,13 @@ def evaluate(listing):
         return None
 
     channel_fallback = "cheap" if cheap else (cat if premium else "main")
+    if has_st:
+        if disc >= STICKER_ITEM_MIN_DISCOUNT and net_fast >= (CHEAP_MIN_PROFIT if cheap else GOOD_MIN_PROFIT):
+            return ("STICKERS ~FREE", f"{disc:.0f}% below the CLEAN-skin reference ({money(ref)}) and it has "
+                    f"stickers | est. profit after fees {money(net_fast)} - check sticker value",
+                    16766720, "🏷️ STICKERED ITEM BELOW CLEAN PRICE", channel_fallback)
+        rej("has stickers (not a craft)")
+        return None
     sales = get_sales(name_orig)
     if sales is None:
         need = PREMIUM_UNVERIFIED_DISCOUNT if premium else DEAL_UNVERIFIED_DISCOUNT
@@ -869,83 +894,69 @@ def evaluate(listing):
 
 
 # ================= POLL =================
-def fetch_feed(sort, lo, hi, pages=1):
-    """Returns (listings or None, sleep_override)."""
+def fetch_feed(sort, lo, hi):
+    """Returns (listings or None, sleep_override, is_error). Waiting for the limiter is NOT an error."""
     global _REF_LOGGED
-    out = []
-    got = False
-    for page in range(pages):
-        params = {"limit": 50, "sort_by": sort, "type": "buy_now"}
-        if lo:
-            params["min_price"] = lo
-        if hi:
-            params["max_price"] = hi
-        if page:
-            params["page"] = page
-        try:
-            r = api_get("/listings", params, LIST_LIM, 120)
-        except Exception as e:
-            log("Request exception:", e)
-            return (out if got else None), 15
-        if r is None:
-            return (out if got else None), min(LIST_LIM.wait_needed(), 120)
-        if r.status_code == 429:
-            return (out if got else None), max(LIST_LIM.blocked_until - time.time(), 1)
-        if r.status_code != 200:
-            log(f"API error {r.status_code}: {r.text[:200]!r}")
-            low = r.text.lower()
-            ov = 120 if ("just a moment" in low or "cloudflare" in low) else 30
-            return (out if got else None), ov
-        try:
-            data = r.json()
-        except Exception:
-            log("Bad JSON from CSFloat")
-            return (out if got else None), 15
-        batch = data if isinstance(data, list) else data.get("data", [])
-        got = True
-        if batch and not _REF_LOGGED:
-            _REF_LOGGED = True
-            log("Sample reference keys:", sorted((batch[0].get("reference") or {}).keys()),
-                "| rate limit headers:", {k: v for k, v in r.headers.items() if "ratelimit" in k.lower()})
-        for l in batch:
-            l["_feed"] = sort
-        out.extend(batch)
-        new = sum(1 for l in batch if l.get("id") and not is_seen(l["id"], l.get("price")))
-        if len(batch) < 50 or new < len(batch) * 0.8:
-            break   # we've caught up; no need for older pages
-        if page == pages - 1:
-            STATS["saturated"] += 1   # still all-new on the last page -> market moved faster than we scan
-    return out, None
+    params = {"limit": 50, "sort_by": sort, "type": "buy_now"}
+    if lo:
+        params["min_price"] = lo
+    if hi:
+        params["max_price"] = hi
+    try:
+        r = api_get("/listings", params, LIST_LIM, 120)
+    except Exception as e:
+        log("Request exception:", e)
+        return None, 15, True
+    if r is None:
+        return None, max(LIST_LIM.wait_needed(), 1), False
+    if r.status_code == 429:
+        return None, max(LIST_LIM.blocked_until - time.time(), 1), False
+    if r.status_code == 400 and sort == "best_deal":
+        FEED_DISABLED.add(sort)
+        log(f"best_deal sort rejected by CSFloat ({r.text[:150]!r}) - feed disabled, using most_recent only")
+        return None, 1, False
+    if r.status_code != 200:
+        log(f"API error {r.status_code}: {r.text[:200]!r}")
+        low = r.text.lower()
+        return None, (120 if ("just a moment" in low or "cloudflare" in low) else 30), True
+    try:
+        data = r.json()
+    except Exception:
+        log("Bad JSON from CSFloat")
+        return None, 15, True
+    batch = data if isinstance(data, list) else data.get("data", [])
+    if batch and not _REF_LOGGED:
+        _REF_LOGGED = True
+        log("Sample reference keys:", sorted((batch[0].get("reference") or {}).keys()),
+            "| rate limit headers:", {k: v for k, v in r.headers.items() if "ratelimit" in k.lower()})
+    for l in batch:
+        l["_feed"] = sort
+    if sort == "most_recent" and len(batch) >= 50 \
+            and all(not is_seen(l.get("id"), l.get("price")) for l in batch if l.get("id")):
+        STATS["saturated"] += 1   # whole page was new -> listings appeared faster than we can fetch
+    return batch, None, False
+
+
+def next_feed():
+    global FEED_I
+    for _ in range(len(FEED_PLAN)):
+        f = FEED_PLAN[FEED_I % len(FEED_PLAN)]
+        FEED_I += 1
+        if f[0] not in FEED_DISABLED:
+            return f
+    return None
 
 
 def poll_once():
     global SALES_BUDGET, LAST_REJ
     SALES_BUDGET = MAX_SALES_CALLS_PER_POLL
-    feeds = [("most_recent", lo, hi, pg) for lo, hi, pg in RECENT_SLICES]
-    if DEAL_FEED_EVERY and STATS["polls"] % DEAL_FEED_EVERY == 0:
-        feeds += [("best_deal", lo, hi, 1) for lo, hi in DEAL_SLICES]
-
-    all_listings = {}
-    got_any = False
-    override = None
-    for sort, lo, hi, pg in feeds:
-        if not RUNNING:
-            break
-        listings, ov = fetch_feed(sort, lo, hi, pg)
-        if listings is None:
-            override = max(override or 0, ov or 0)
-            if ov and ov >= 30:
-                break   # blocked: don't hammer the remaining feeds
-            continue
-        got_any = True
-        if ov:
-            override = max(override or 0, ov)
-        for l in listings:
-            lid = l.get("id")
-            if lid and lid not in all_listings:
-                all_listings[lid] = l
-    if not got_any:
-        return False, override
+    feed = next_feed()
+    if not feed:
+        return False, 60
+    listings, override, is_err = fetch_feed(*feed)
+    if listings is None:
+        return (not is_err), override
+    all_listings = {l["id"]: l for l in listings if l.get("id")}
 
     now = time.time()
     changed = False
@@ -1000,7 +1011,7 @@ def poll_once():
         RETRIES.clear()
     if changed:
         save_seen()
-    return True, override if override else None
+    return True, None
 
 
 # ================= STATUS =================
@@ -1027,7 +1038,8 @@ def status_report(final=False):
            f"HTTP: {http}\n"
            f"Missed-window events: {STATS['saturated']} · time paused by rate limits: {STATS['blocked_s']:.0f}s · "
            f"undeliverable alerts: {STATS['post_fail']}\n"
-           f"Listings limiter: limit {LIST_LIM.limit} / remaining {LIST_LIM.remaining} / gap {LIST_LIM.gap:.2f}s\n"
+           f"Listings allowance: {LIST_LIM.remaining} of {LIST_LIM.limit} left, resets in "
+           f"{max(0, (LIST_LIM.reset_ts or 0) - now):.0f}s · requests this run: {sum(HTTP.values())}\n"
            f"**Why listings did NOT alert:**\n{top}\n"
            f"**Best listings that were rejected (5%+ under ref):**\n{near}")
     simple_message(txt[:4000], 15158332 if unhealthy else 3447003, hook)
