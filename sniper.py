@@ -70,7 +70,8 @@ FEED_PLAN = [
     ("most_recent", 200, 600),
     ("best_deal", 600, 1500),
     ("most_recent", 600, 1500),
-    ("best_deal", 0, 1500),
+    ("best_deal", 1500, 5000),
+    ("most_recent", 1500, 5000),
 ]
 FEED_DISABLED = set()
 FEED_I = 0
@@ -95,11 +96,10 @@ MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached 
 # Liquid weapons. (DEALS_ANY_WEAPON below keeps the general scanner open for every gun anyway.)
 TARGET_WEAPONS = ["ak-47", "m4a4", "m4a1-s", "mac-10", "awp",
                   "glock", "usp", "desert eagle", "p250", "five-seven", "tec-9", "cz75", "p2000", "dual berettas", "r8 revolver"]
-# Volume strategy: MANY small flips (~40/day at ~0.40 EUR each) instead of a few big ones.
-# 150 EUR budget / 40 buys = ~$4.30 average buy, so the cap is low and cheap skins are the main target.
-MAX_SKIN_PRICE = 15.00
+# Volume strategy: MANY small flips. Cheap skins are the main target, up to $50.
+MAX_SKIN_PRICE = 50.00
 MIN_SKIN_PRICE = 0.50
-ENABLE_KNIVES_GLOVES = False      # too expensive for the budget; set True to scan them again
+ENABLE_KNIVES_GLOVES = False      # set True to scan knives/gloves again
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
@@ -116,6 +116,7 @@ GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP               # % SP
 # Charms attached to a gun are part of its value: they count in the discount AND the profit estimate.
 CHARM_VALUE_FACTOR = 1.0          # share of the charm's value counted (lower it, e.g. 0.7, to be more cautious)
 CHARM_FALLBACK_MAX_USD = 1.00     # if CSFloat gives no charm price, use (float est. - base) but only up to this
+ENABLE_CHARMS = False             # PAUSED: no charm alerts, and charm value is not counted in gun profits
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
 FAIR_PREMIUM_PCT = 25.0
@@ -124,7 +125,7 @@ FAIR_SLACK = 0.30
 # --- general "deal" scanner ---
 ENABLE_DEALS = True
 DEALS_ANY_WEAPON = False         # only TARGET_WEAPONS (AK, M4s, MAC-10, AWP, pistols)
-DEAL_MIN_DISCOUNT = 2.5           # % below float-adjusted reference price (cheap pre-filter, no API call)
+DEAL_MIN_DISCOUNT = 2.0           # % below float-adjusted reference price (cheap pre-filter, no API call)
 PRED_CAP = 1.00                   # CSFloat's float-adjusted price is NEVER trusted above the base price
                                   # (it over-values extreme floats nobody actually pays for). It can only LOWER the estimate.
 DEAL_MIN_SALES = 3
@@ -133,21 +134,21 @@ PREMIUM_UNVERIFIED_DISCOUNT = 12.0
 RETRY_MAX = 3                     # polls to wait for sales data before falling back
 
 SELL_FEE = 0.02
-# Nobody pays the full reference price: you realistically list a bit under it. All profit numbers (and the
-# alert thresholds) use this undercut. Set to 0.0 to go back to "sell at full reference price".
-SELL_UNDERCUT_PCT = 1.3
+# You list a tiny bit under the reference price (in dollars, NOT percent). All profit numbers and the alert
+# thresholds use this. 0.02 = 2 cents under. Set to 0.0 to assume you sell at the full reference price.
+SELL_UNDERCUT_USD = 0.02
 # How resale value is estimated. The old rule used the LOWER of CSFloat's reference price and the recent
 # sales median, which under-estimates liquid skins you can really sell at/above the reference.
 RESALE_CAPPED_BY_MEDIAN = False   # True = old, pessimistic behaviour
 RESALE_BOOST_PCT = 0.0            # e.g. 2.0 if you routinely sell ~2% above CSFloat's reference price
 MIN_STABILITY = 3
-# Profit targets (USD). Goal ~ $18 (~16 EUR) per day: ~20 buys at ~$0.90 average. "GOOD" is the volume tier,
-# "STRONG" is the ~$0.80+ tier you really want.
-STRONG_MIN_PROFIT = 0.60
-STRONG_MIN_PCT = 8.0
+# Profit targets (USD, after the 2% fee and the undercut). Volume strategy: 7 cents is enough for an alert.
+# "STRONG" just marks the better ones.
+STRONG_MIN_PROFIT = 0.40
+STRONG_MIN_PCT = 5.0
 STRONG_MIN_STABILITY = 5
-GOOD_MIN_PROFIT = 0.35
-GOOD_MIN_PCT = 6.0
+GOOD_MIN_PROFIT = 0.07
+GOOD_MIN_PCT = 0.0          # no percentage requirement, only the profit in dollars
 SALES_MAX_AGE_DAYS = 30           # only sales this recent count for avg/median/stability (old one-off sales can't fool the check)
 MAX_KNIFE_PRICE = 259.00
 MAX_GLOVE_PRICE = 259.00
@@ -162,12 +163,12 @@ BLUE_SKINS = [
     "atheris", "fever dream", "cortex", "cyrex", "bunsen burner", "glacier mesh", "ice cap",
     "sapphire", "azure", "blue steel", "oceanic", "hydroponic",
 ]
-OUNCETRA_MAX_PRICE = 15.00
+OUNCETRA_MAX_PRICE = 50.00
 OUNCETRA_MIN_DISCOUNT = 0.5
 
-CHEAP_MAX_PRICE = 1.50
-CHEAP_MIN_PROFIT = 0.15
-BREAKEVEN_MIN_PROFIT = 0.30       # "SMALL PROFIT" tier
+CHEAP_MAX_PRICE = 1.20          # roughly 1 EUR
+CHEAP_MIN_PROFIT = 0.06
+BREAKEVEN_MIN_PROFIT = 0.07
 BREAKEVEN_MIN_STABILITY = 4
 
 ENABLE_SKINPORT = True
@@ -671,14 +672,14 @@ def get_pred_price(listing):
 
 
 def sell_estimate(listing, item, price):
-    """(list_price, you_receive_after_fee, profit, ref_value) if sold SELL_UNDERCUT_PCT under the reference price."""
+    """(list_price, you_receive_after_fee, profit, ref_value) if sold SELL_UNDERCUT_USD under the reference price."""
     base = get_base_price(listing)
     if not base:
         return None
     pred = get_pred_price(listing)
     ref = min(pred, base * PRED_CAP) if pred else base
     ref_eff = ref + charm_bonus(listing, item)
-    sell = ref_eff * (1 - SELL_UNDERCUT_PCT / 100.0)
+    sell = ref_eff - SELL_UNDERCUT_USD
     got = sell * (1 - SELL_FEE)
     return sell, got, got - price, ref_eff
 
@@ -707,6 +708,8 @@ def compute_sp(listing, item):
 
 def charm_bonus(listing, item):
     """Value (USD, already discounted by CHARM_VALUE_FACTOR) of a charm attached to a gun."""
+    if not ENABLE_CHARMS:
+        return 0.0
     keys = item.get("keychains") or []
     if not keys and item.get("keychain_pattern") is None:
         return 0.0
@@ -795,7 +798,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         desc.append(" · ".join(line2))
     if est:
         sell_p, got, prof, _ = est
-        desc.append(f"💵 Sell ~{money(sell_p)} ({SELL_UNDERCUT_PCT:g}% under) → you get **{money(got)}** "
+        desc.append(f"💵 Sell ~{money(sell_p)} (${SELL_UNDERCUT_USD:.2f} under) → you get **{money(got)}** "
                     f"after {SELL_FEE * 100:g}% fee → **{money(prof)}** profit ({prof / price * 100:+.1f}%)")
     desc.append(f"\n📌 **Trigger:** {trigger_text}")
 
@@ -811,7 +814,7 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
         sell_p, got, prof, ref_v = est
         stick_note = "\n_Skin value only, stickers not counted._" if item.get("stickers") else ""
         fields.append({"name": "💵 If you sell it", "value":
-                       f"Reference: {money(ref_v)}\nList at {money(sell_p)} ({SELL_UNDERCUT_PCT:g}% under)\n"
+                       f"Reference: {money(ref_v)}\nList at {money(sell_p)} (${SELL_UNDERCUT_USD:.2f} under)\n"
                        f"You get: **{money(got)}** after {SELL_FEE * 100:g}% fee\n"
                        f"Profit: **{money(prof)}** ({prof / price * 100:+.1f}%)" + stick_note,
                        "inline": False})
@@ -889,6 +892,9 @@ def evaluate(listing):
     cat = item_category(name_orig)
     if EXCLUDE_SOUVENIRS and is_souvenir(name, item):
         rej("souvenir (excluded)")
+        return None
+    if not ENABLE_CHARMS and charm_item:
+        rej("charm (paused)")
         return None
     if not ENABLE_STICKER_ALERTS and item.get("stickers"):
         rej("stickered item (sticker alerts off)")
@@ -987,7 +993,7 @@ def evaluate(listing):
     if disc < DEAL_MIN_DISCOUNT:
         rej("below reference < %.1f%%" % DEAL_MIN_DISCOUNT)
         return None
-    net_fast = ref_eff * (1 - SELL_UNDERCUT_PCT / 100.0) * (1 - SELL_FEE) - price
+    net_fast = (ref_eff - SELL_UNDERCUT_USD) * (1 - SELL_FEE) - price
     if net_fast < (CHEAP_MIN_PROFIT if cheap else 0):
         rej("no edge after fees (pre-check)")
         return None
@@ -1033,10 +1039,10 @@ def evaluate(listing):
         rej("recent sales median below listing price")
         return None
     resale = (min(ref, s["median"]) if RESALE_CAPPED_BY_MEDIAN else ref) * (1 + RESALE_BOOST_PCT / 100.0) + bonus
-    net = resale * (1 - SELL_UNDERCUT_PCT / 100.0) * (1 - SELL_FEE) - price
+    net = (resale - SELL_UNDERCUT_USD) * (1 - SELL_FEE) - price
     net_pct = net / price * 100
-    trig = (f"Est. net profit after {SELL_UNDERCUT_PCT:g}% undercut + {SELL_FEE * 100:g}% fee: {money(net)} ({net_pct:+.0f}%) "
-            f"| resale est. {money(resale * (1 - SELL_UNDERCUT_PCT / 100.0))} (recent median {money(s['median'])}) | {disc:.0f}% below market{charm_note}")
+    trig = (f"Est. net profit after ${SELL_UNDERCUT_USD:.2f} undercut + {SELL_FEE * 100:g}% fee: {money(net)} ({net_pct:+.0f}%) "
+            f"| resale est. {money(resale - SELL_UNDERCUT_USD)} (recent median {money(s['median'])}) | {disc:.0f}% below market{charm_note}")
     if premium:
         if net >= PREMIUM_STRONG_PROFIT and net_pct >= STRONG_MIN_PCT \
                 and s["stability"] >= STRONG_MIN_STABILITY:
