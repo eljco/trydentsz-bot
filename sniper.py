@@ -36,6 +36,7 @@ WEBHOOKS = {
     "knives": os.environ.get("DISCORD_WEBHOOK_KNIVES", "").strip() or DISCORD_WEBHOOK,
     "gloves": os.environ.get("DISCORD_WEBHOOK_GLOVES", "").strip() or DISCORD_WEBHOOK,
     "ouncetra": os.environ.get("DISCORD_WEBHOOK_OUNCETRA", "").strip() or DISCORD_WEBHOOK,
+    "buyorders": os.environ.get("DISCORD_WEBHOOK_BUYORDERS", "").strip() or DISCORD_WEBHOOK,
 }
 
 if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
@@ -174,6 +175,25 @@ BREAKEVEN_MIN_STABILITY = 4
 ENABLE_SKINPORT = True
 SKINPORT_REFRESH = 330
 
+# --- buy-order gap scanner (#buyorders channel) ---
+# For the most liquid guns up to ~50 EUR: compare the HIGHEST BUY ORDER with the lowest listing / base price.
+# If the gap is big you can place a buy order 1 cent above the top bid and sell at the listing price later.
+# Costs 2 CSFloat requests per skin (lowest listing + its buy orders), taken from the same rate limit.
+ENABLE_BUYORDERS = True
+BO_EVERY = int(os.environ.get("BO_EVERY", "4"))   # every Nth poll is a buy-order scan (4 = about 40% of requests)
+BO_MAX_PRICE_USD = 57.5           # about 50 EUR
+BO_MIN_PRICE_USD = 1.0
+BO_MAX_ITEMS = 40                 # how many skins are rotated through
+BO_MIN_SKINPORT_QTY = 20          # liquidity filter: at least this many listings on Skinport
+# These are ALWAYS included (all wears that fit the price range), the rest is picked by liquidity automatically
+BO_PRIORITY = ["ak-47 | inheritance", "awp | ice coaled", "m4a1-s | black lotus", "ak-47 | elite build",
+               "ak-47 | crane flight"]
+BO_BID_STEP = 0.01                # you outbid the top buy order by this much
+BO_MIN_PROFIT = 0.10              # $ profit after fee and undercut
+BO_MIN_GAP_PCT = 3.0              # % profit on the buy price
+BO_REALERT_MIN = 180              # same skin is only posted again after this many minutes ...
+BO_REALERT_IMPROVE = 0.15         # ... unless the profit grew by this many dollars
+
 CHARM_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
     69, 6969, 420, 42069, 4545, 8989, 2323, 12223,
@@ -208,6 +228,12 @@ RUNNING = True
 ALERTQ = queue.PriorityQueue()   # (priority, seq, job): 0 = plain deals / system, 1 = sticker crafts
 _SEQ = itertools.count()
 _REF_LOGGED = False
+BO_ITEMS = []
+BO_ITEMS_TS = 0.0
+BO_PENDING = {}                  # name -> (listing_id, ask, base, ts) when the 2nd request had to wait
+BO_RUN = {}                      # name -> result of the latest scan in this run (for the status report)
+BO_POLLS = max(BO_EVERY - 1, 0)  # so the very FIRST poll of a run is a buy-order scan (current gaps right away)
+_BO_LOGGED = False
 
 
 def rej(reason):
@@ -1066,6 +1092,211 @@ def evaluate(listing):
     return None
 
 
+
+# ================= BUY-ORDER GAP SCANNER =================
+def bo_build_items():
+    """Liquid guns up to ~50 EUR: priority skins first, then the most listed ones on Skinport."""
+    sp = (PRICE_SOURCES.get("Skinport") or {}).get("data") or {}
+    cands = []
+    for name, d in sp.items():
+        low = name.lower()
+        if "souvenir" in low or "stattrak" in low or low.startswith("★") or " | " not in name:
+            continue
+        weapon = low.split(" | ")[0]
+        if not any(w in weapon for w in TARGET_WEAPONS):
+            continue
+        p = d.get("price") or 0
+        if not (BO_MIN_PRICE_USD <= p <= BO_MAX_PRICE_USD):
+            continue
+        qty = d.get("qty") or 0
+        pri = any(k in low for k in BO_PRIORITY)
+        if pri or qty >= BO_MIN_SKINPORT_QTY:
+            cands.append((0 if pri else 1, -qty, name))
+    cands.sort()
+    return [n for _, _, n in cands[:BO_MAX_ITEMS]]
+
+
+def _bo_advance(idx, now):
+    SEEN["bo:idx"] = [now, idx + 1]
+
+
+def build_bo_embed(name, l0, bids, ask, base, bid, sell, got, net, net_pct, top):
+    item = l0.get("item") or {}
+    lid = l0.get("id")
+    gap_ask = ask - top
+    gap_ask_pct = gap_ask / ask * 100 if ask else 0
+    others = cheapest_elsewhere(name)
+    sell_basis = "base price" if (base and base < ask) else "lowest listing"
+    fields = [
+        {"name": "🧾 Highest buy order", "value": money(top), "inline": True},
+        {"name": "💰 Lowest listing", "value": money(ask), "inline": True},
+        {"name": "📊 Base price", "value": money(base), "inline": True},
+        {"name": "↔️ Gap listing − top bid", "value": f"{money(gap_ask)} ({gap_ask_pct:.1f}%)", "inline": True},
+    ]
+    if base:
+        fields.append({"name": "↔️ Gap base − top bid",
+                       "value": f"{money(base - top)} ({(base - top) / base * 100:.1f}%)", "inline": True})
+    fields.append({"name": "🧱 Top buy orders", "value": " · ".join(f"{money(p)} x{q}" for p, q in bids[:5]) or "?",
+                   "inline": False})
+    fields.append({"name": "📝 The play",
+                   "value": f"1. Place a buy order at **{money(bid)}** (top bid + {money(BO_BID_STEP)})\n"
+                            f"2. When it fills, list at **{money(sell)}** ({money(SELL_UNDERCUT_USD)} under the {sell_basis})\n"
+                            f"3. You get **{money(got)}** after {SELL_FEE * 100:g}% fee → profit **{money(net)}** "
+                            f"({net_pct:+.1f}%)\n"
+                            f"_A buy order only fills if someone sells into it, and needs CSFloat balance._",
+                   "inline": False})
+    if others:
+        fields.append({"name": "🏪 Skinport lowest", "value": ", ".join(f"[{n}]({u}) {money(p)}" for n, p, u in others)[:1000],
+                       "inline": False})
+    if lid:
+        fields.append({"name": "🛒 Open", "value": f"[Lowest listing on CSFloat](https://csfloat.com/item/{lid})",
+                       "inline": False})
+    for f in fields:
+        f["value"] = str(f["value"])[:1024] or "?"
+    embed = {
+        "title": f"🧾 BUY ORDER GAP — {name}",
+        "url": f"https://csfloat.com/item/{lid}" if lid else None,
+        "description": f"**{money(net)} profit** ({net_pct:+.1f}%) if you outbid the top buy order by "
+                       f"{money(BO_BID_STEP)} and sell near the {sell_basis}.",
+        "color": 5763719 if net_pct >= 8 else 16766720,
+        "fields": fields,
+        "footer": {"text": f"Cloud Sniper v3.1 • buy-order scanner • {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M:%S')} UTC"},
+    }
+    embed = {k: v for k, v in embed.items() if v is not None}
+    icon = item.get("icon_url")
+    if icon:
+        embed["thumbnail"] = {"url": f"https://community.cloudflare.steamstatic.com/economy/image/{icon}/360fx360f"}
+    return {"username": "trydentsz cs2 bot 🔥", "embeds": [embed]}
+
+
+def _bo_http_result(r):
+    """(done, ok, override) for a non-200 / limiter response, or None if the response is usable."""
+    if r is None:
+        return True, True, max(LIST_LIM.wait_needed(), 1)
+    if r.status_code == 429:
+        return True, True, max(LIST_LIM.blocked_until - time.time(), 1)
+    if r.status_code in (400, 404):
+        return True, True, None        # skip this skin, nothing wrong with the connection
+    if r.status_code != 200:
+        log(f"Buy-order scan API error {r.status_code}: {r.text[:150]!r}")
+        low = r.text.lower()
+        return True, False, (120 if ("just a moment" in low or "cloudflare" in low) else 30)
+    return None
+
+
+def bo_scan_once():
+    """Scans ONE skin: lowest listing + highest buy order. Returns (ok, sleep_override) like poll_once."""
+    global BO_ITEMS, BO_ITEMS_TS, _BO_LOGGED
+    now = time.time()
+    if not BO_ITEMS or now - BO_ITEMS_TS > 1800:
+        items = bo_build_items()
+        if items:
+            BO_ITEMS, BO_ITEMS_TS = items, now
+            log(f"Buy-order scanner: {len(items)} liquid skins in rotation")
+    if not BO_ITEMS:
+        rej("buy-order scan skipped (no Skinport list yet)")
+        return True, None
+    idx = int((SEEN.get("bo:idx") or [0, 0])[1]) % len(BO_ITEMS)
+    name = BO_ITEMS[idx]
+
+    pend = BO_PENDING.get(name)
+    if pend and now - pend[3] < 600:
+        lid, ask, base, _ = pend
+        l0 = {"id": lid, "price": int(ask * 100), "item": {}}
+    else:
+        try:
+            r = api_get("/listings", {"limit": 10, "sort_by": "lowest_price", "type": "buy_now",
+                                      "market_hash_name": name}, LIST_LIM, 120)
+        except Exception as e:
+            log("Buy-order scan request exception:", e)
+            return False, 15
+        bad = _bo_http_result(r)
+        if bad:
+            if bad[2] is None or bad[1] is False:
+                _bo_advance(idx, now)
+            return bad[1], bad[2]
+        try:
+            data = r.json()
+        except Exception:
+            _bo_advance(idx, now)
+            return False, 15
+        batch = data if isinstance(data, list) else data.get("data", [])
+        plain = [l for l in batch if l.get("id") and (l.get("price") or 0) > 0
+                 and not (l.get("item") or {}).get("stickers") and not (l.get("item") or {}).get("keychains")
+                 and not is_souvenir(name.lower(), l.get("item") or {})]
+        plain.sort(key=lambda l: l["price"])
+        if not plain:
+            rej("buy-order scan: no plain listing")
+            _bo_advance(idx, now)
+            return True, None
+        l0 = plain[0]
+        lid, ask, base = l0["id"], l0["price"] / 100.0, get_base_price(l0)
+
+    try:
+        r2 = api_get(f"/listings/{lid}/buy-orders", {"limit": 5}, LIST_LIM, 120)
+    except Exception as e:
+        log("Buy-order scan request exception:", e)
+        return False, 15
+    bad = _bo_http_result(r2)
+    if bad:
+        if r2 is None or (r2 is not None and r2.status_code == 429):
+            BO_PENDING[name] = (lid, ask, base, now)       # retry only the 2nd request later
+        else:
+            _bo_advance(idx, now)
+        return bad[1], bad[2]
+    BO_PENDING.pop(name, None)
+    _bo_advance(idx, now)
+    try:
+        data2 = r2.json()
+    except Exception:
+        return False, 15
+    orders = data2 if isinstance(data2, list) else (data2.get("data") or data2.get("orders")
+                                                      or data2.get("buy_orders") or [])
+    if not _BO_LOGGED:
+        _BO_LOGGED = True
+        log("Buy-order sample:", json.dumps(orders[:1])[:300] if orders else repr(data2)[:300])
+    bids = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        p_ = o.get("price") or o.get("max_price") or o.get("bid")
+        q_ = o.get("qty") or o.get("quantity") or 1
+        if p_:
+            bids.append((p_ / 100.0, q_))
+    bids.sort(reverse=True)
+    STATS["bo_scans"] = STATS.get("bo_scans", 0) + 1
+    if not bids:
+        rej("buy-order scan: no buy orders")
+        return True, None
+
+    top = bids[0][0]
+    bid = top + BO_BID_STEP
+    ref_sell = min(ask, base) if base else ask
+    sell = ref_sell - SELL_UNDERCUT_USD
+    got = sell * (1 - SELL_FEE)
+    net = got - bid
+    net_pct = net / bid * 100 if bid else 0
+    BO_RUN[name] = {"net": net, "pct": net_pct, "top": top, "ask": ask, "base": base, "lid": lid}
+
+    if net < BO_MIN_PROFIT or net_pct < BO_MIN_GAP_PCT:
+        rej("buy-order gap too small")
+        return True, None
+    key = "bo:" + name
+    prev = SEEN.get(key)
+    if prev and now - prev[0] < BO_REALERT_MIN * 60 and net * 100 < (prev[1] if len(prev) > 1 else 0) + BO_REALERT_IMPROVE * 100:
+        rej("buy-order gap already posted")
+        return True, None
+    SEEN[key] = [now, int(net * 100)]
+    try:
+        payload = build_bo_embed(name, l0, bids, ask, base, bid, sell, got, net, net_pct, top)
+        enqueue(payload, WEBHOOKS.get("buyorders") or DISCORD_WEBHOOK,
+                f"[buyorders] {name} top bid ${top:.2f} / ask ${ask:.2f} -> ${net:.2f}")
+    except Exception as e:
+        log("Error building buy-order alert:", repr(e))
+    save_seen()
+    return True, None
+
+
 # ================= POLL =================
 def fetch_feed(sort, lo, hi, extra=None, tag=None):
     """Returns (listings or None, sleep_override, is_error). Waiting for the limiter is NOT an error."""
@@ -1140,7 +1371,11 @@ def choose_feed():
 
 
 def poll_once():
-    global SALES_BUDGET, LAST_REJ
+    global SALES_BUDGET, LAST_REJ, BO_POLLS
+    if ENABLE_BUYORDERS and BO_EVERY > 0:
+        BO_POLLS += 1
+        if BO_POLLS % BO_EVERY == 0:
+            return bo_scan_once()
     SALES_BUDGET = MAX_SALES_CALLS_PER_POLL
     feed = choose_feed()
     if not feed:
@@ -1211,6 +1446,15 @@ def poll_once():
 
 
 # ================= STATUS =================
+def bo_status_line():
+    if not ENABLE_BUYORDERS:
+        return "Buy-order scanner: off"
+    best = sorted(BO_RUN.items(), key=lambda kv: kv[1]["pct"], reverse=True)[:3]
+    txt = " · ".join(f"{n.split(' | ')[-1][:28]} {v['pct']:+.0f}% (bid {money(v['top'])})" for n, v in best) or "none yet"
+    return (f"Buy-order scans: {STATS.get('bo_scans', 0)} · skins in rotation: {len(BO_ITEMS)} · "
+            f"biggest gaps this run: {txt}")
+
+
 def status_report(final=False):
     total_req = sum(HTTP.values()) or 1
     bad = HTTP[429] + HTTP[403] + HTTP[503] + HTTP[502]
@@ -1237,6 +1481,7 @@ def status_report(final=False):
            f"Craft queries: {STATS['craft_polls']} · learned premium sticker ids: {len(STICKER_DB)}\n"
            f"Listings allowance: {LIST_LIM.remaining} of {LIST_LIM.limit} left, resets in "
            f"{max(0, (LIST_LIM.reset_ts or 0) - now):.0f}s · requests this run: {sum(HTTP.values())}\n"
+           f"{bo_status_line()}\n"
            f"**Why listings did NOT alert:**\n{top}\n"
            f"**Best listings that were rejected (5%+ under ref):**\n{near}")
     simple_message(txt[:4000], 15158332 if unhealthy else 3447003, hook)
