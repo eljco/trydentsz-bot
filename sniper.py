@@ -18,12 +18,12 @@ import statistics
 import sys
 import threading
 import time
-import buyer
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+import buyer
 
 # ================= CONFIG =================
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
@@ -45,26 +45,15 @@ if not DISCORD_WEBHOOK or not CSFLOAT_API_KEY:
     sys.exit(1)
 
 # --- loop timing ---
-# RUN_SECONDS > 0 -> GitHub Actions mode (poll that long, exit). RUN_SECONDS = 0 -> run forever (VPS).
 RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "1500"))
 BOUNDED = RUN_SECONDS > 0
-POLL_INTERVAL = 0.5            # target seconds per full cycle; the rate limiter slows this down if needed
-# Listings older than this are ignored (checked on every feed except the sticker-craft feed).
-# 2 hours: catches deals that were missed or that the best_deal feed keeps surfacing.
+POLL_INTERVAL = 0.5
 MAX_LISTING_AGE = int(os.environ.get("MAX_LISTING_AGE_HOURS", "2")) * 60 * 60
 
-# Status reports (why things did/didn't alert). Always-on: hourly to status channel (or every 6h to main).
-# Actions mode: one report at the end of each run, only if a status webhook is set.
 STATUS_HOOK = STATUS_HOOK_ENV or (DISCORD_WEBHOOK if not BOUNDED else "")
 STATUS_EVERY_MIN = 60 if STATUS_HOOK_ENV else 360
 FAIL_ALERT_AFTER = 0 if BOUNDED else 10
 
-# --- feeds ---
-# ONE request per poll, rotating through this plan. The limiter spreads requests evenly over CSFloat's
-# rate-limit window, so we never burn the allowance. "best_deal" keeps showing already-discounted listings
-# until they sell, so it finds deals with far fewer requests than "most_recent".
-# (sort, min_price_cents, max_price_cents)
-# Weighted towards the $0-$50 range where the liquid guns live; knives/gloves get one slice up to ~$260.
 FEED_PLAN = [
     ("best_deal", 0, 200),
     ("most_recent", 0, 200),
@@ -77,81 +66,62 @@ FEED_PLAN = [
 ]
 FEED_DISABLED = set()
 FEED_I = 0
-# --- craft hunter: dedicated queries for listings carrying the most valuable premium stickers ---
-# The bot LEARNS sticker ids from listings it sees, then every CRAFT_FEED_EVERY-th request asks CSFloat for the
-# CHEAPEST listings carrying one of the top stickers (cheapest skin + expensive sticker = lowest SP).
-# Crafts are rare and hard to sell, so they get a smaller share of requests than before (1 in 5).
-# Sticker crafts are OFF by default: they tie up lots of money, are hard to sell and flooded the alerts.
-# Set ENABLE_STICKER_ALERTS=true (env) to turn crafts, the craft hunter and "stickers ~free" alerts back on.
+
 ENABLE_STICKER_ALERTS = os.environ.get("ENABLE_STICKER_ALERTS", "false").lower() == "true"
 CRAFT_FEED_EVERY = 5 if ENABLE_STICKER_ALERTS else 0
-CRAFT_TOP_N = 20                  # how many of the most valuable learned stickers to rotate through
-CRAFT_MIN_STICKER_CENTS = 300     # ignore stickers worth less than $3
-EXTRA_STICKER_IDS = []            # optional: add CSFloat sticker ids you always want checked, e.g. [123, 456]
+CRAFT_TOP_N = 20
+CRAFT_MIN_STICKER_CENTS = 300
+EXTRA_STICKER_IDS = []
 STICKER_FILE = os.environ.get("STICKER_FILE", "sticker_ids.json")
-EXCLUDE_SOUVENIRS = True          # souvenirs are skipped completely (no alerts of any kind)
-STICKER_ITEM_MIN_VALUE = 5.0      # '~free stickers' alerts need at least this much sticker value ($)
-STICKER_ITEM_MIN_DISCOUNT = 5.0   # stickered item priced this far under the CLEAN skin price = stickers ~free
-MAX_SALES_CALLS_PER_POLL = 15  # cap on sales-history lookups per cycle (cached per skin for 15 min)
+EXCLUDE_SOUVENIRS = True
+STICKER_ITEM_MIN_VALUE = 5.0
+STICKER_ITEM_MIN_DISCOUNT = 5.0
+MAX_SALES_CALLS_PER_POLL = 15
 
-# --- what to look for ---
-# Liquid weapons. (DEALS_ANY_WEAPON below keeps the general scanner open for every gun anyway.)
 TARGET_WEAPONS = ["ak-47", "m4a4", "m4a1-s", "mac-10", "awp",
                   "glock", "usp", "desert eagle", "p250", "five-seven", "tec-9", "cz75", "p2000", "dual berettas", "r8 revolver"]
-# Volume strategy: MANY small flips. Cheap skins are the main target, up to $50.
 MAX_SKIN_PRICE = 50.00
 MIN_SKIN_PRICE = 0.50
-ENABLE_KNIVES_GLOVES = False      # set True to scan knives/gloves again
+ENABLE_KNIVES_GLOVES = False
 
 PREMIUM_STICKERS = [
     "katowice 2014", "katowice 2015", "cologne 2015", "krakow 2017",
     "boston 2018", "london 2018", "cologne 2016", "mlg columbus 2016",
 ]
-# Sticker crafts are harder to sell than plain skins, so only VERY low SP (0-3.3%) is worth an alert.
 STICKER_MAX_SP = 3.3
 MAX_SP_BY_COUNT = {1: STICKER_MAX_SP, 2: STICKER_MAX_SP, 3: STICKER_MAX_SP, 4: STICKER_MAX_SP}
-STICKER_MAX_PRICE = 300.00   # 4x old-tournament crafts cost far more than $50
-# Generic craft rule: ANY gun (not only TARGET_WEAPONS) with valuable stickers applied cheaply
-GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0   # $ total sticker value (CSFloat reference prices)
-GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP               # % SP
+STICKER_MAX_PRICE = 300.00
+GENERIC_CRAFT_MIN_STICKER_VALUE = 10.0
+GENERIC_CRAFT_MAX_SP = STICKER_MAX_SP
 
-# Charms attached to a gun are part of its value: they count in the discount AND the profit estimate.
-CHARM_VALUE_FACTOR = 1.0          # share of the charm's value counted (lower it, e.g. 0.7, to be more cautious)
-CHARM_FALLBACK_MAX_USD = 1.00     # if CSFloat gives no charm price, use (float est. - base) but only up to this
-ENABLE_CHARMS = False             # PAUSED: no charm alerts, and charm value is not counted in gun profits
+CHARM_VALUE_FACTOR = 1.0
+CHARM_FALLBACK_MAX_USD = 1.00
+ENABLE_CHARMS = False
 ALLOW_CHARMS_ON_GUNS = False
 ENABLE_SKIN_PATTERNS = False
 FAIR_PREMIUM_PCT = 25.0
 FAIR_SLACK = 0.30
 
-# --- general "deal" scanner ---
 ENABLE_DEALS = True
-DEALS_ANY_WEAPON = False         # only TARGET_WEAPONS (AK, M4s, MAC-10, AWP, pistols)
-DEAL_MIN_DISCOUNT = 2.0           # % below float-adjusted reference price (cheap pre-filter, no API call)
-PRED_CAP = 1.00                   # CSFloat's float-adjusted price is NEVER trusted above the base price
-                                  # (it over-values extreme floats nobody actually pays for). It can only LOWER the estimate.
+DEALS_ANY_WEAPON = False
+DEAL_MIN_DISCOUNT = 2.0
+PRED_CAP = 1.00
 DEAL_MIN_SALES = 3
-DEAL_UNVERIFIED_DISCOUNT = 7.0    # sales data unavailable -> still alert at this % below reference
+DEAL_UNVERIFIED_DISCOUNT = 7.0
 PREMIUM_UNVERIFIED_DISCOUNT = 12.0
-RETRY_MAX = 3                     # polls to wait for sales data before falling back
+RETRY_MAX = 3
 
 SELL_FEE = 0.02
-# You list a tiny bit under the reference price (in dollars, NOT percent). All profit numbers and the alert
-# thresholds use this. 0.02 = 2 cents under. Set to 0.0 to assume you sell at the full reference price.
 SELL_UNDERCUT_USD = 0.02
-# How resale value is estimated. The old rule used the LOWER of CSFloat's reference price and the recent
-# sales median, which under-estimates liquid skins you can really sell at/above the reference.
-RESALE_CAPPED_BY_MEDIAN = False   # True = old, pessimistic behaviour
-RESALE_BOOST_PCT = 0.0            # e.g. 2.0 if you routinely sell ~2% above CSFloat's reference price
+RESALE_CAPPED_BY_MEDIAN = False
+RESALE_BOOST_PCT = 0.0
 MIN_STABILITY = 3
-# Profit targets (USD, after the 2% fee and the undercut). Volume strategy: 7 cents is enough for an alert.
-# "STRONG" just marks the better ones.
 STRONG_MIN_PROFIT = 0.40
 STRONG_MIN_PCT = 5.0
 STRONG_MIN_STABILITY = 5
 GOOD_MIN_PROFIT = 0.07
-GOOD_MIN_PCT = 0.0          # no percentage requirement, only the profit in dollars
-SALES_MAX_AGE_DAYS = 30           # only sales this recent count for avg/median/stability (old one-off sales can't fool the check)
+GOOD_MIN_PCT = 0.0
+SALES_MAX_AGE_DAYS = 30
 MAX_KNIFE_PRICE = 259.00
 MAX_GLOVE_PRICE = 259.00
 PREMIUM_MIN_SALES = 3
@@ -168,7 +138,7 @@ BLUE_SKINS = [
 OUNCETRA_MAX_PRICE = 50.00
 OUNCETRA_MIN_DISCOUNT = 0.5
 
-CHEAP_MAX_PRICE = 1.20          # roughly 1 EUR
+CHEAP_MAX_PRICE = 1.20
 CHEAP_MIN_PROFIT = 0.06
 BREAKEVEN_MIN_PROFIT = 0.07
 BREAKEVEN_MIN_STABILITY = 4
@@ -176,24 +146,19 @@ BREAKEVEN_MIN_STABILITY = 4
 ENABLE_SKINPORT = True
 SKINPORT_REFRESH = 330
 
-# --- buy-order gap scanner (#buyorders channel) ---
-# For the most liquid guns up to ~50 EUR: compare the HIGHEST BUY ORDER with the lowest listing / base price.
-# If the gap is big you can place a buy order 1 cent above the top bid and sell at the listing price later.
-# Costs 2 CSFloat requests per skin (lowest listing + its buy orders), taken from the same rate limit.
 ENABLE_BUYORDERS = True
-BO_EVERY = int(os.environ.get("BO_EVERY", "4"))   # every Nth poll is a buy-order scan (4 = about 40% of requests)
-BO_MAX_PRICE_USD = 57.5           # about 50 EUR
+BO_EVERY = int(os.environ.get("BO_EVERY", "4"))
+BO_MAX_PRICE_USD = 57.5
 BO_MIN_PRICE_USD = 1.0
-BO_MAX_ITEMS = 40                 # how many skins are rotated through
-BO_MIN_SKINPORT_QTY = 20          # liquidity filter: at least this many listings on Skinport
-# These are ALWAYS included (all wears that fit the price range), the rest is picked by liquidity automatically
+BO_MAX_ITEMS = 40
+BO_MIN_SKINPORT_QTY = 20
 BO_PRIORITY = ["ak-47 | inheritance", "awp | ice coaled", "m4a1-s | black lotus", "ak-47 | elite build",
                "ak-47 | crane flight"]
-BO_BID_STEP = 0.01                # you outbid the top buy order by this much
-BO_MIN_PROFIT = 0.10              # $ profit after fee and undercut
-BO_MIN_GAP_PCT = 3.0              # % profit on the buy price
-BO_REALERT_MIN = 180              # same skin is only posted again after this many minutes ...
-BO_REALERT_IMPROVE = 0.15         # ... unless the profit grew by this many dollars
+BO_BID_STEP = 0.01
+BO_MIN_PROFIT = 0.10
+BO_MIN_GAP_PCT = 3.0
+BO_REALERT_MIN = 180
+BO_REALERT_IMPROVE = 0.15
 
 CHARM_PATTERNS = {
     111, 123, 1234, 12345, 321, 1122, 2233, 2345, 6767, 67,
@@ -205,40 +170,39 @@ SKIN_PATTERNS = {111, 123, 321, 67, 69, 420, 222, 333, 444, 555, 666, 777, 888, 
 CSFLOAT = "https://csfloat.com/api/v1"
 SEEN_FILE = os.environ.get("SEEN_FILE", "seen_ids.json")
 MAX_SEEN = 20000
-REALERT_ON_DROP_PCT = 2.0    # a listing is re-evaluated if its price drops by at least this much
+REALERT_ON_DROP_PCT = 2.0
 
 # ================= STATE =================
 session = requests.Session()
-SEEN = {}                    # listing_id -> [unix time, price_cents]
-HISTORY_CACHE = {}           # name -> (ts, sales)
+SEEN = {}
+HISTORY_CACHE = {}
 SALES_CACHE_TTL = 900
 PRICE_SOURCES = {}
 REJ = Counter()
 HTTP = Counter()
 RETRIES = {}
 STATS = {"polls": 0, "listings": 0, "alerts": 0, "errors": 0, "saturated": 0, "post_fail": 0, "blocked_s": 0, "craft_polls": 0}
-STICKER_DB = {}               # sticker id -> [name, reference price cents]
+STICKER_DB = {}
 CRAFT_I = 0
 POLL_N = 0
 CRAFT_DISABLED = False
 LAST_REJ = None
-NEAR = []                    # best-looking listings that were rejected: (discount, name, price, reason, id)
+NEAR = []
 SALES_BUDGET = 0
 LAST_ALERT = 0.0
 RUNNING = True
-ALERTQ = queue.PriorityQueue()   # (priority, seq, job): 0 = plain deals / system, 1 = sticker crafts
+ALERTQ = queue.PriorityQueue()
 _SEQ = itertools.count()
 _REF_LOGGED = False
 BO_ITEMS = []
 BO_ITEMS_TS = 0.0
-BO_PENDING = {}                  # name -> (listing_id, ask, base, ts) when the 2nd request had to wait
-BO_RUN = {}                      # name -> result of the latest scan in this run (for the status report)
-BO_POLLS = max(BO_EVERY - 1, 0)  # so the very FIRST poll of a run is a buy-order scan (current gaps right away)
+BO_PENDING = {}
+BO_RUN = {}
+BO_POLLS = max(BO_EVERY - 1, 0)
 _BO_LOGGED = False
 
 
 def rej(reason):
-    """Count a rejection and remember the reason (used for the near-miss report)."""
     global LAST_REJ
     REJ[reason] += 1
     LAST_REJ = reason
@@ -340,11 +304,11 @@ def is_seen(lid, price_cents):
         return False
     old = e[1] if len(e) > 1 else 0
     if price_cents and old and price_cents < old * (1 - REALERT_ON_DROP_PCT / 100.0):
-        return False   # price dropped -> evaluate again
+        return False
     return True
 
 
-# ================= DISCORD (background thread) =================
+# ================= DISCORD =================
 def _post(payload, webhook):
     for _ in range(5):
         try:
@@ -374,7 +338,7 @@ def discord_worker():
         try:
             payload, webhook, label = job
             ok = _post(payload, webhook)
-            if not ok and label:   # retry with a minimal embed (no fields) so the alert is never lost
+            if not ok and label:
                 emb = (payload.get("embeds") or [{}])[0]
                 mini = {"username": payload.get("username"), "embeds": [{k: v for k, v in {
                     "title": (emb.get("title") or "Alert")[:250], "url": emb.get("url"),
@@ -487,8 +451,6 @@ def _hnum(h, *keys):
 
 
 class Limiter:
-    """Spaces requests, honours x-ratelimit-* / Retry-After headers, slows down after 429s, recovers over time."""
-
     def __init__(self, name, base_gap):
         self.name = name
         self.base_gap = base_gap
@@ -505,11 +467,11 @@ class Limiter:
         w = max(self.blocked_until - now, self.last + self.gap - now, 0.0)
         if self.remaining is not None and self.reset_ts and self.reset_ts > now:
             window = self.reset_ts - now
-            avail = self.remaining - 3            # keep a small reserve
+            avail = self.remaining - 3
             if avail <= 0:
-                w = max(w, window)                # allowance used up -> wait for the reset
+                w = max(w, window)
             else:
-                w = max(w, self.last + window / avail - now)   # spread what is left evenly
+                w = max(w, self.last + window / avail - now)
         return w
 
     def update(self, r):
@@ -545,7 +507,6 @@ HIST_LIM = Limiter("history", 0.6)
 
 
 def api_get(path, params, lim, max_wait):
-    """Returns Response, or None if we'd have to wait longer than max_wait."""
     w = lim.wait_needed()
     if w > max_wait:
         return None
@@ -567,7 +528,6 @@ def api_get(path, params, lim, max_wait):
 
 # ================= SALES HISTORY =================
 def get_sales(name, budgeted=True):
-    """List of sales, or None if unavailable (budget used up / rate limited / error)."""
     global SALES_BUDGET
     c = HISTORY_CACHE.get(name)
     if c and time.time() - c[0] < SALES_CACHE_TTL:
@@ -595,7 +555,6 @@ def get_sales(name, budgeted=True):
 
 
 def _sale_is_recent(s):
-    """True if the sale is within SALES_MAX_AGE_DAYS (sales without a parsable date are kept)."""
     if not SALES_MAX_AGE_DAYS:
         return True
     created = s.get("created_at")
@@ -699,7 +658,6 @@ def get_pred_price(listing):
 
 
 def sell_estimate(listing, item, price):
-    """(list_price, you_receive_after_fee, profit, ref_value) if sold SELL_UNDERCUT_USD under the reference price."""
     base = get_base_price(listing)
     if not base:
         return None
@@ -734,14 +692,13 @@ def compute_sp(listing, item):
 
 
 def charm_bonus(listing, item):
-    """Value (USD, already discounted by CHARM_VALUE_FACTOR) of a charm attached to a gun."""
     if not ENABLE_CHARMS:
         return 0.0
     keys = item.get("keychains") or []
     if not keys and item.get("keychain_pattern") is None:
         return 0.0
     val = sum(((k.get("reference") or {}).get("price") or 0) for k in keys) / 100.0
-    if val <= 0:   # no charm price from CSFloat -> small, capped part of its float estimate
+    if val <= 0:
         base, pred = get_base_price(listing), get_pred_price(listing)
         if base and pred and pred > base:
             diff = pred - base
@@ -751,7 +708,7 @@ def charm_bonus(listing, item):
 
 
 def is_standalone_charm(name, item=None):
-    return name.startswith("charm |")   # guns WITH a charm attached are still normal guns
+    return name.startswith("charm |")
 
 
 def get_charm_pattern(item):
@@ -904,7 +861,6 @@ def build_embed(title, listing, item, price, trigger_text, color, verdict=None):
 
 # ================= LISTING EVALUATION =================
 def evaluate(listing):
-    """Returns (title, trigger_text, color, verdict[, channel]) or None or "RETRY"."""
     item = listing.get("item") or {}
     name_orig = item.get("market_hash_name") or ""
     name = name_orig.lower()
@@ -927,12 +883,10 @@ def evaluate(listing):
         rej("stickered item (sticker alerts off)")
         return None
 
-    # 1. rare charm pattern
     if is_target and (charm_item or ALLOW_CHARMS_ON_GUNS) and charm_pattern is not None \
             and check_pattern(charm_pattern, CHARM_PATTERNS):
         return ("RARE CHARM PATTERN", f"Matched charm pattern: {charm_pattern}", 16711680, "💎 RARE CHARM")
 
-    # 2. sticker crafts
     if cat == "gun" and not charm_item and not is_souvenir(name, item) and price <= STICKER_MAX_PRICE \
             and item.get("stickers"):
         sp = compute_sp(listing, item)
@@ -955,7 +909,6 @@ def evaluate(listing):
                     f"{sp:.1f}% SP on {money(sv)} of stickers | {names[:200]}",
                     16711680, "🏷️ CHEAP STICKERS")
 
-    # 3. rare gun pattern
     if (is_target and ENABLE_SKIN_PATTERNS and not charm_item and price <= MAX_SKIN_PRICE
             and check_pattern(skin_pattern, SKIN_PATTERNS, max_value=1000, generic=False)):
         ok, base = fair_price_ok(listing, price)
@@ -963,7 +916,6 @@ def evaluate(listing):
             return ("RARE SKIN PATTERN", f"Pattern {skin_pattern} at fair price (base ${base:.2f})",
                     16711680, "🌱 RARE PATTERN")
 
-    # 4. extreme float (any gun)
     if cat == "gun" and not charm_item and price <= MAX_SKIN_PRICE:
         msg = check_float(float_val)
         if msg:
@@ -972,7 +924,6 @@ def evaluate(listing):
                 return ("EXTREME FLOAT", f"{msg} | paying ${price:.2f} vs base ${base:.2f}",
                         16711680, "🎯 EXTREME FLOAT")
 
-    # 5a. blue gun skins
     if cat == "gun" and is_blue_skin(name) and not is_souvenir(name, item) \
             and not item.get("stickers") and not charm_item and MIN_SKIN_PRICE <= price <= OUNCETRA_MAX_PRICE:
         b = get_base_price(listing)
@@ -989,7 +940,6 @@ def evaluate(listing):
         else:
             rej("blue skin: no base price")
 
-    # 5. deal vs market
     premium = cat in ("knives", "gloves")
     if premium and not ENABLE_KNIVES_GLOVES:
         rej("knife/glove (disabled)")
@@ -1000,10 +950,7 @@ def evaluate(listing):
     if not (MIN_SKIN_PRICE <= price <= max_price):
         rej("price out of range")
         return None
-    if item.get("stickers"):
-        has_st = True
-    else:
-        has_st = False
+    has_st = bool(item.get("stickers"))
     if premium and any(k in name for k in PATTERN_DEPENDENT):
         return None
     base = get_base_price(listing)
@@ -1011,9 +958,9 @@ def evaluate(listing):
         rej("no base price")
         return None
     pred = get_pred_price(listing)
-    ref = min(pred, base * PRED_CAP) if pred else base   # float-adjusted reference
+    ref = min(pred, base * PRED_CAP) if pred else base
     bonus = charm_bonus(listing, item)
-    ref_eff = ref + bonus                       # gun value + charm value = CSFloat "Final Price"
+    ref_eff = ref + bonus
     disc = (ref_eff - price) / ref_eff * 100
     charm_note = f" | incl. {money(bonus)} charm bonus" if bonus > 0 else ""
     cheap = price <= CHEAP_MAX_PRICE and not premium
@@ -1062,7 +1009,7 @@ def evaluate(listing):
         rej("too volatile")
         return None
 
-    if s["median"] < price:   # sanity check: recent sales are mostly BELOW what we'd pay
+    if s["median"] < price:
         rej("recent sales median below listing price")
         return None
     resale = (min(ref, s["median"]) if RESALE_CAPPED_BY_MEDIAN else ref) * (1 + RESALE_BOOST_PCT / 100.0) + bonus
@@ -1093,10 +1040,8 @@ def evaluate(listing):
     return None
 
 
-
 # ================= BUY-ORDER GAP SCANNER =================
 def bo_build_items():
-    """Liquid guns up to ~50 EUR: priority skins first, then the most listed ones on Skinport."""
     sp = (PRICE_SOURCES.get("Skinport") or {}).get("data") or {}
     cands = []
     for name, d in sp.items():
@@ -1171,13 +1116,12 @@ def build_bo_embed(name, l0, bids, ask, base, bid, sell, got, net, net_pct, top)
 
 
 def _bo_http_result(r):
-    """(done, ok, override) for a non-200 / limiter response, or None if the response is usable."""
     if r is None:
         return True, True, max(LIST_LIM.wait_needed(), 1)
     if r.status_code == 429:
         return True, True, max(LIST_LIM.blocked_until - time.time(), 1)
     if r.status_code in (400, 404):
-        return True, True, None        # skip this skin, nothing wrong with the connection
+        return True, True, None
     if r.status_code != 200:
         log(f"Buy-order scan API error {r.status_code}: {r.text[:150]!r}")
         low = r.text.lower()
@@ -1186,7 +1130,6 @@ def _bo_http_result(r):
 
 
 def bo_scan_once():
-    """Scans ONE skin: lowest listing + highest buy order. Returns (ok, sleep_override) like poll_once."""
     global BO_ITEMS, BO_ITEMS_TS, _BO_LOGGED
     now = time.time()
     if not BO_ITEMS or now - BO_ITEMS_TS > 1800:
@@ -1241,7 +1184,7 @@ def bo_scan_once():
     bad = _bo_http_result(r2)
     if bad:
         if r2 is None or (r2 is not None and r2.status_code == 429):
-            BO_PENDING[name] = (lid, ask, base, now)       # retry only the 2nd request later
+            BO_PENDING[name] = (lid, ask, base, now)
         else:
             _bo_advance(idx, now)
         return bad[1], bad[2]
@@ -1279,6 +1222,9 @@ def bo_scan_once():
     net_pct = net / bid * 100 if bid else 0
     BO_RUN[name] = {"net": net, "pct": net_pct, "top": top, "ask": ask, "base": base, "lid": lid}
 
+    # Wired buyer hook for gaps
+    buyer.on_gap(name, lid, ask, base, top)
+
     if net < BO_MIN_PROFIT or net_pct < BO_MIN_GAP_PCT:
         rej("buy-order gap too small")
         return True, None
@@ -1300,7 +1246,6 @@ def bo_scan_once():
 
 # ================= POLL =================
 def fetch_feed(sort, lo, hi, extra=None, tag=None):
-    """Returns (listings or None, sleep_override, is_error). Waiting for the limiter is NOT an error."""
     global _REF_LOGGED
     params = {"limit": 50, "sort_by": sort, "type": "buy_now"}
     if lo:
@@ -1344,7 +1289,7 @@ def fetch_feed(sort, lo, hi, extra=None, tag=None):
         l["_feed"] = tag or sort
     if sort == "most_recent" and len(batch) >= 50 \
             and all(not is_seen(l.get("id"), l.get("price")) for l in batch if l.get("id")):
-        STATS["saturated"] += 1   # whole page was new -> listings appeared faster than we can fetch
+        STATS["saturated"] += 1
     return batch, None, False
 
 
@@ -1359,7 +1304,6 @@ def next_feed():
 
 
 def choose_feed():
-    """Mostly the rotating plan; every CRAFT_FEED_EVERY-th request is a targeted sticker query."""
     global POLL_N
     POLL_N += 1
     if CRAFT_FEED_EVERY and not CRAFT_DISABLED and POLL_N % CRAFT_FEED_EVERY == 0:
@@ -1390,13 +1334,12 @@ def poll_once():
     now = time.time()
     changed = False
     ordered = sorted(all_listings.values(), key=lambda l: l.get("created_at") or "", reverse=True)
-    ordered.sort(key=lambda l: bool((l.get("item") or {}).get("stickers")))   # stable: plain skins first
+    ordered.sort(key=lambda l: bool((l.get("item") or {}).get("stickers")))
     for listing in ordered:
         lid = listing["id"]
         price_cents = listing.get("price") or 0
         if is_seen(lid, price_cents):
             continue
-        # Age filter on every feed except the sticker-craft hunter (stale listings are not worth a sales lookup)
         if listing.get("_feed") != "craft" and not is_fresh(listing):
             SEEN[lid] = [now, price_cents]
             changed = True
@@ -1433,6 +1376,11 @@ def poll_once():
             item = listing.get("item") or {}
             price = price_cents / 100.0
             try:
+                # Wired buyer hook for deals
+                buyer_note = buyer.on_deal(listing, hit)
+                if buyer_note:
+                    trig += buyer_note
+
                 payload = build_embed(title, listing, item, price, trig, color, verdict)
                 enqueue(payload, WEBHOOKS.get(channel) or DISCORD_WEBHOOK,
                         f"[{channel}] {title} {item.get('market_hash_name')} ${price:.2f}",
@@ -1498,6 +1446,9 @@ def main():
     if ENABLE_SKINPORT:
         register_source("Skinport", fetch_skinport, SKINPORT_REFRESH)
 
+    # Wired buyer start
+    buyer.start(sys.modules[__name__])
+
     if SEND_TEST_ALERT:
         for ch, hook in WEBHOOKS.items():
             simple_message(f"✅ **TEST ALERT:** sniper is alive — this is the **{ch}** channel.", 5763719, hook)
@@ -1517,6 +1468,7 @@ def main():
         try:
             refresh_sources()
             ok, override = poll_once()
+            buyer.maintain()  # Wired buyer maintenance check
         except Exception as e:
             log("Unexpected error:", repr(e))
             ok, override = False, 20
@@ -1552,6 +1504,7 @@ def main():
         sleep_interruptible(end - time.time())
 
     save_seen()
+    buyer.finish()  # Wired buyer finish save
     log(f"Run finished: {STATS['polls']} polls, {successes} ok, {STATS['listings']} listings checked, "
         f"{STATS['alerts']} alerts. HTTP: {dict(HTTP)}")
     log("Why listings did not alert:", dict(REJ))
