@@ -26,8 +26,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Queue the NEXT run right now. It waits in the concurrency group and starts the second this job
-      # ends, so there is no gap between runs (and no overlap).
       - name: Queue next run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -44,12 +42,14 @@ jobs:
       - name: Install Dependencies
         run: pip install requests brotli
 
-      - name: Restore seen listings
+      - name: Restore seen listings & buyer state
         uses: actions/cache/restore@v4
         with:
-          path: seen_ids.json
-          key: seen-${{ github.run_id }}
-          restore-keys: seen-
+          path: |
+            seen_ids.json
+            buyer_state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
 
       - name: Run Sniper Script
         env:
@@ -66,10 +66,11 @@ jobs:
           RUN_SECONDS: '1500'
         run: python sniper.py
 
-      # always() so seen-ids are saved even if the run failed (prevents duplicate alerts next run)
-      - name: Save seen listings
+      - name: Save seen listings & buyer state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: seen_ids.json
-          key: seen-${{ github.run_id }}
+          path: |
+            seen_ids.json
+            buyer_state.json
+          key: state-${{ github.run_id }}
