@@ -13,6 +13,14 @@ Rules (all tunable via env, see the CONFIG block):
   * hard daily budget (EUR -> USD), money is reserved BEFORE every call and persisted to buyer_state.json,
     which the workflow caches between runs
   * open buy orders count against the budget until they are cancelled, filled or expired
+  * NEW: every purchase goes into a ledger (buyer_state.json -> "inv"). After the 7-day trade lock the bot lists
+    the item at CSFloat's reference price (the float-adjusted "predicted price" of the sell menu) minus 1 cent,
+    keeps it 1 cent under the reference, notices the sale and tracks the ~8 days until the money is usable again.
+    Only items the bot bought itself are ever listed - nothing else in your inventory is touched.
+  * NEW: rolling bankroll cap (CAPITAL_EUR): money tied up in unsold / not yet credited items + open orders
+    can never exceed it, no matter what the daily budget says.
+
+AUTOLIST_MODE (env): off | notify (DEFAULT, only posts what it WOULD list, lists nothing) | live (real listings)
 """
 import json
 import os
@@ -40,9 +48,22 @@ if MODE not in ("off", "dry", "live"):
 ACTIVE = MODE != "off"
 LIVE = MODE == "live"
 
-DAILY_BUDGET_EUR = _num("DAILY_BUDGET_EUR", 5.0)
-EUR_USD_RATE = _num("EUR_USD_RATE", 1.10)          # CSFloat prices are USD; keep this a bit LOW to stay under 5 EUR
+DAILY_BUDGET_EUR = _num("DAILY_BUDGET_EUR", 8.0)
+EUR_USD_RATE = _num("EUR_USD_RATE", 1.10)          # CSFloat prices are USD; keep this a bit LOW to stay under budget
 BUDGET_CENTS = int(DAILY_BUDGET_EUR * EUR_USD_RATE * 100)
+# rolling bankroll: everything bought and not yet back as usable balance (14 days per cycle) must stay under this
+CAPITAL_EUR = _num("CAPITAL_EUR", 116.0)
+CAPITAL_CENTS = int(CAPITAL_EUR * EUR_USD_RATE * 100)
+
+# auto-listing
+AUTOLIST_MODE = os.environ.get("AUTOLIST_MODE", "notify").strip().lower()
+if AUTOLIST_MODE not in ("off", "notify", "live"):
+    AUTOLIST_MODE = "notify"          # an unknown value must never become "live"
+LOCK_DAYS = _num("TRADE_LOCK_DAYS", 7.0)            # Steam trade protection on the item we bought
+CREDIT_DAYS = _num("CREDIT_DAYS", 7.0)              # sale -> money usable (green "Credit Trades Now" banner shows with <24h left)
+LIST_UNDERCUT_CENTS = int(_num("LIST_UNDERCUT_CENTS", 1))
+LIST_ALLOW_LOSS = os.environ.get("LIST_ALLOW_LOSS", "true").strip().lower() == "true"   # list even if below cost
+REPRICE_EVERY_MIN = _num("REPRICE_EVERY_MIN", 60.0)  # how often a listing is re-checked against the reference
 MAX_ITEM_USD = _num("BUY_MAX_ITEM_USD", 3.00)      # no single purchase / order above this
 MAX_ITEM_CENTS = int(MAX_ITEM_USD * 100)
 MIN_PROFIT_USD = _num("BUY_MIN_PROFIT_USD", 0.03)  # net, after the 2% fee and the sniper's SELL_UNDERCUT_USD
@@ -55,10 +76,10 @@ LIQ_MIN_SALES = int(_num("LIQ_MIN_SALES", 10))             # at least this many 
 LIQ_MAX_LAST_SALE_HOURS = _num("LIQ_MAX_LAST_SALE_HOURS", 8.0)   # ... and the latest one at most this old
 
 ORDER_TTL_HOURS = _num("BUY_ORDER_TTL_HOURS", 6.0)         # our own open buy orders are cancelled after this long
-MAX_ACTIONS_PER_RUN = int(_num("BUY_MAX_ACTIONS_PER_RUN", 25))
+MAX_ACTIONS_PER_RUN = int(_num("BUY_MAX_ACTIONS_PER_RUN", 60))
 COOLDOWN_AFTER_UNKNOWN = 30        # seconds without trading after an unclear result
 MAX_UNKNOWN_PER_RUN = 3            # that many unclear results in one run -> trading disabled until the next run
-MAINTAIN_EVERY = 600               # seconds between order reconcile / expiry checks
+MAINTAIN_EVERY = 300               # seconds between order reconcile / expiry / inventory checks
 BUDGET_TZ = os.environ.get("BUDGET_TZ", "UTC").strip() or "UTC"   # the daily budget resets at midnight in this zone
 STATE_FILE = os.environ.get("BUYER_STATE_FILE", "buyer_state.json")
 TRADES_HOOK = os.environ.get("DISCORD_WEBHOOK_TRADES", "").strip()   # falls back to the main webhook
@@ -106,6 +127,8 @@ def _load():
         for key, default in fresh.items():
             a.setdefault(key, default)
         st[k] = a
+    if not isinstance(st.get("inv"), dict):
+        st["inv"] = {}
     return st, existed
 
 
@@ -169,6 +192,8 @@ def _gate(cents):
         return "per-run action limit"
     if cents > MAX_ITEM_CENTS:
         return f"above max item price {_usd(MAX_ITEM_CENTS)}"
+    if tied_cents() + reserved() + cents > CAPITAL_CENTS:
+        return "bankroll tied up (waiting for sales / credits)"
     if committed() + cents > BUDGET_CENTS:
         if ACCT.get("bn") != ACCT["day"]:
             ACCT["bn"] = ACCT["day"]
@@ -350,10 +375,10 @@ def _on_deal(listing, hit):
     net, basis = _net(price, est[3], s["median"])
     if net < MIN_PROFIT_USD:
         return _skip(f"net {net:+.2f} below minimum {MIN_PROFIT_USD:.2f}")
-    return _buy_now(lid, name, cents, net, basis, n, last_h)
+    return _buy_now(lid, name, cents, net, basis, n, last_h, item)
 
 
-def _buy_now(lid, name, cents, net, basis, n, last_h):
+def _buy_now(lid, name, cents, net, basis, n, last_h, item=None):
     RUN["actions"] += 1
     ACCT["spent"] += cents                 # reserve first: if anything below goes wrong the money still counts
     ACCT["bought"][lid] = time.time()
@@ -369,7 +394,9 @@ def _buy_now(lid, name, cents, net, basis, n, last_h):
     outcome, status, data = _call("POST", "/listings/buy", {"contract_ids": [lid], "total_price": cents})
     if outcome == "ok":
         RUN["bought"] += 1
-        _notify(f"🛒 **BOUGHT** {detail}\n{left}", 5763719)
+        _inv_add(lid, name, cents, (item or {}).get("float_value"))
+        _notify(f"🛒 **BOUGHT** {detail}\n{left}\nTrade lock ends ~{_fmt_ts(time.time() + LOCK_DAYS * 86400)} "
+                f"(accept the seller's Steam trade offer!)", 5763719)
         return "\n🤖 AUTO-BOUGHT"
     if outcome == "rejected":
         ACCT["spent"] -= cents
@@ -470,6 +497,8 @@ def maintain(force=False):
             _check_balance()
             _reconcile()
         _expire_orders()
+        if LIVE and AUTOLIST_MODE != "off":
+            _inventory_cycle()
         save()
     except Exception as e:
         M.log("buyer: maintenance error:", repr(e))
@@ -525,6 +554,7 @@ def _reconcile():
         if state == "filled":
             ACCT["spent"] += int(o["cents"])
             RUN["filled"] += 1
+            _inv_add(f"bo-{oid}", o["name"], int(o["cents"]), None)
             _notify(f"✅ **Buy order no longer open (counted as filled)**: {o['name']} up to {_usd(o['cents'])}", 5763719)
 
 
@@ -553,6 +583,237 @@ def _expire_orders():
             ACCT["spent"] += int(o["cents"])
         else:
             M.log(f"buyer: could not cancel {oid} ({outcome} {status}), will retry")
+
+
+
+# ================= INVENTORY LEDGER / AUTO-LIST / SALES =================
+# statuses: bought (waiting for the trade lock / listing) -> listed -> sold (waiting for the money) -> credited
+ACTIVE_INV = ("bought", "listed", "sold")
+
+
+def _inv():
+    return STATE.setdefault("inv", {})
+
+
+def tied_cents():
+    return sum(int(v.get("cost", 0)) for v in _inv().values() if v.get("status") in ACTIVE_INV)
+
+
+def _inv_counts():
+    c = Counter(v.get("status") for v in _inv().values() if v.get("status") in ACTIVE_INV)
+    return f"{c['bought']} locked/unlisted, {c['listed']} listed, {c['sold']} awaiting credit"
+
+
+def _fmt_ts(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%d %b %H:%M UTC")
+
+
+def _inv_add(key, name, cents, flt):
+    if not LIVE:
+        return
+    _inv()[str(key)] = {"name": name, "cost": int(cents), "float": flt, "bought": time.time(),
+                        "status": "bought", "retry": 0, "fails": 0}
+    save()
+
+
+def _norm_inv(raw):
+    """Inventory rows differ a bit between API versions: flat item or {"item": {...}, "reference": {...}}."""
+    if not isinstance(raw, dict):
+        return None
+    it = raw.get("item") if isinstance(raw.get("item"), dict) else raw
+    ref = raw.get("reference") or it.get("reference") or {}
+    aid = it.get("asset_id") or raw.get("asset_id")
+    if aid is None:
+        return None
+    return {"asset_id": str(aid), "name": it.get("market_hash_name"), "float": it.get("float_value"),
+            "listing_id": raw.get("listing_id") or it.get("listing_id"),
+            "pred": ref.get("predicted_price"), "base": ref.get("base_price"),
+            "tradable": it.get("tradable", raw.get("tradable"))}
+
+
+def _float_eq(a, b):
+    try:
+        return abs(float(a) - float(b)) < 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _match(e, rows, used):
+    for r in rows:
+        if r["asset_id"] in used or r["name"] != e["name"]:
+            continue
+        if e.get("float") is not None and not _float_eq(r["float"], e["float"]):
+            continue
+        return r
+    return None
+
+
+def _list_price(pred, base):
+    """CSFloat's sell menu reference = the float-adjusted predicted price (falls back to the base price)."""
+    basis = pred or base
+    if not basis:
+        return None, None
+    return max(int(basis) - LIST_UNDERCUT_CENTS, 1), int(basis)
+
+
+def _net_cents(price_cents, cost):
+    return int(price_cents * (1 - M.SELL_FEE)) - int(cost)
+
+
+def _inventory_cycle():
+    now = time.time()
+    inv = _inv()
+    for k, v in list(inv.items()):                  # forget finished items after 30 days
+        if v.get("status") == "credited" and now - v.get("credited_ts", now) > 30 * 86400:
+            inv.pop(k, None)
+    due_list = [k for k, v in inv.items() if v.get("status") == "bought"
+                and now >= v["bought"] + LOCK_DAYS * 86400 and now >= v.get("retry", 0)]
+    listed = [k for k, v in inv.items() if v.get("status") == "listed"]
+    sold = [k for k, v in inv.items() if v.get("status") == "sold"]
+
+    if listed:
+        _sales_scan(listed, now)
+    for k in sold:
+        v = inv[k]
+        if now >= v.get("credit_ts", 0):
+            v["status"], v["credited_ts"] = "credited", now
+            got = _net_cents(v.get("list_price", 0), v["cost"])
+            _notify(f"💶 **Money should be usable now**: {v['name']} (sold {_usd(v.get('list_price', 0))}, est. profit "
+                    f"{'+' if got >= 0 else '-'}{_usd(abs(got))}). If CSFloat still shows the green verify/credit "
+                    f"button for it, press it. {_inv_counts()}", 5763719)
+    for k in listed:                                # re-check price / state of what is still listed
+        v = inv[k]
+        if v.get("status") == "listed" and now - v.get("chk", 0) >= REPRICE_EVERY_MIN * 60:
+            _check_listed(k, v, now)
+    if due_list and AUTOLIST_MODE in ("notify", "live"):
+        _list_due(due_list, now)
+    save()
+
+
+def _list_due(keys, now):
+    inv = _inv()
+    outcome, status, data = _call("GET", "/me/inventory")
+    rows = _extract_list(data) if outcome == "ok" else None
+    if rows is None and outcome == "ok" and isinstance(data, dict):
+        rows = _extract_list(data.get("inventory")) if "inventory" in data else None
+    if rows is None:
+        M.log(f"buyer: could not read inventory ({outcome} {status})")
+        return
+    rows = [r for r in (_norm_inv(x) for x in rows) if r]
+    used = {v.get("asset_id") for v in inv.values() if v.get("asset_id")}
+    for k in keys:
+        e = inv[k]
+        r = _match(e, rows, used)
+        if r is None:
+            e["retry"] = now + 1800                 # not in the inventory yet (trade offer not accepted / still moving)
+            if now > e["bought"] + 21 * 86400 and not e.get("lost_note"):
+                e["lost_note"] = True
+                _notify(f"⚠️ {e['name']} bought {_fmt_ts(e['bought'])} is still not in your inventory. "
+                        f"Did you accept the seller's trade offer?", 16766720)
+            continue
+        used.add(r["asset_id"])
+        if r.get("listing_id"):                     # already in the stall (listed by hand?) -> just track it
+            e.update(status="listed", asset_id=r["asset_id"], list_id=str(r["listing_id"]), chk=now,
+                     listed_ts=now, list_price=e.get("list_price", 0))
+            continue
+        if r.get("tradable") in (0, False, "0"):
+            e["retry"] = now + 1800                 # Steam still says locked
+            continue
+        price, basis = _list_price(r["pred"], r["base"])
+        if price is None:
+            e["retry"] = now + 1800
+            continue
+        net = _net_cents(price, e["cost"])
+        loss = f"\n⚠️ below cost: est. {_usd(net)}" if net < 0 else ""
+        if net < 0 and not LIST_ALLOW_LOSS:
+            e["retry"] = now + 6 * 3600
+            _notify(f"⏸️ Not listing {e['name']}: reference {_usd(basis)} would lose money (cost {_usd(e['cost'])}). "
+                    f"Retrying in 6h.", 16766720)
+            continue
+        info = (f"{e['name']} for **{_usd(price)}** (reference {_usd(basis)} - {LIST_UNDERCUT_CENTS}c) · "
+                f"cost {_usd(e['cost'])} · est. net **{'+' if net >= 0 else '-'}{_usd(abs(net))}** after 2% fee{loss}")
+        if AUTOLIST_MODE != "live":
+            e["retry"] = now + 6 * 3600
+            _notify(f"🧪 **WOULD LIST** {info}\nAUTOLIST_MODE=notify, nothing was listed.", 10070709)
+            continue
+        oc, st, d = _call("POST", "/listings", {"asset_id": r["asset_id"], "type": "buy_now", "price": price,
+                                                "description": "", "private": False})
+        if oc == "ok":
+            lid = _extract_id(d)
+            e.update(status="listed", asset_id=r["asset_id"], list_id=lid, list_price=price, chk=now, listed_ts=now)
+            _notify(f"🏷️ **LISTED** {info}", 5763719)
+            if not lid:
+                M.log("buyer: listing created but no id in the answer:", str(d)[:200])
+        elif oc == "rejected":
+            e["fails"] = e.get("fails", 0) + 1
+            e["retry"] = now + (1800 if e["fails"] < 4 else 6 * 3600)
+            M.log(f"buyer: listing {e['name']} rejected ({st}): {_msg(d)}")
+            if e["fails"] in (1, 4):
+                _notify(f"⚠️ Could not list {e['name']} ({st}): {_msg(d)}. Retrying later.", 16766720)
+        else:
+            e["retry"] = now + 300                  # unclear: next round the inventory shows a listing_id if it worked
+            M.log(f"buyer: listing {e['name']} unclear ({st})")
+
+
+def _trade_cid(t):
+    return str(t.get("contract_id") or (t.get("contract") or {}).get("id") or "")
+
+
+def _sales_scan(keys, now):
+    inv = _inv()
+    oc, st, data = _call("GET", "/me/trades", params={"role": "seller", "state": "pending,verified",
+                                                      "limit": 100, "page": 0})
+    trades = _extract_list(data) if oc == "ok" else None
+    if trades is None and oc == "ok" and isinstance(data, dict):
+        trades = _extract_list(data.get("trades")) if "trades" in data else None
+    if trades is None:
+        return
+    by = {_trade_cid(t): t for t in trades if isinstance(t, dict) and _trade_cid(t)}
+    for k in keys:
+        v = inv[k]
+        if v.get("list_id") and str(v["list_id"]) in by:
+            _mark_sold(v, now)
+
+
+def _mark_sold(v, now):
+    v["status"], v["sold_ts"], v["credit_ts"] = "sold", now, now + CREDIT_DAYS * 86400
+    net = _net_cents(v.get("list_price", 0), v["cost"])
+    held = (now - v.get("listed_ts", now)) / 3600
+    _notify(f"💰 **SOLD** {v['name']} for {_usd(v.get('list_price', 0))} after {held:.1f}h listed · est. net "
+            f"{'+' if net >= 0 else '-'}{_usd(abs(net))}\n"
+            f"➡️ **Accept the sale on CSFloat and send the Steam trade offer now** (the bot cannot do that).\n"
+            f"Money usable ~{_fmt_ts(v['credit_ts'])}. {_inv_counts()}", 5763719)
+
+
+def _check_listed(k, v, now):
+    v["chk"] = now
+    if not v.get("list_id"):
+        return
+    oc, st, data = _call("GET", f"/listings/{v['list_id']}")
+    if oc == "ok" and isinstance(data, dict):
+        state = str(data.get("state") or data.get("status") or "").lower()
+        if state == "sold":
+            _mark_sold(v, now)
+            return
+        if state in ("", "listed", "active"):
+            ref = data.get("reference") or {}
+            new, basis = _list_price(ref.get("predicted_price"), ref.get("base_price"))
+            cur = data.get("price")
+            changed = bool(new) and isinstance(cur, (int, float)) and int(cur) != new
+            if changed and (LIST_ALLOW_LOSS or _net_cents(new, v["cost"]) >= 0):
+                oc2, st2, d2 = _call("PATCH", f"/listings/{v['list_id']}", {"price": new})
+                if oc2 == "ok":
+                    v["list_price"] = new
+                    M.log(f"buyer: repriced {v['name']} {int(cur)} -> {new}")
+            else:
+                v["list_price"] = int(cur) if isinstance(cur, (int, float)) else v.get("list_price", 0)
+            return
+    if (oc == "rejected" and st == 404) or (oc == "ok" and isinstance(data, dict)):
+        # gone / not "listed": relist it unless the trades scan already caught it as sold
+        v.update(status="bought", retry=0, fails=0)
+        v.pop("list_id", None)
+        v.pop("asset_id", None)
+        _notify(f"⚠️ Listing of {v['name']} is gone and no sale was found. The bot will list it again.", 16766720)
 
 
 # ================= LIFECYCLE =================
@@ -591,7 +852,8 @@ def status_line():
         return "Auto-buy: off"
     skips = ", ".join(f"{k}: {v}" for k, v in SKIPS.most_common(4)) or "-"
     bal = f" · balance {_usd(RUN['balance'])}" if RUN["balance"] is not None else ""
-    return (f"Auto-buy [{MODE}]{' DISABLED' if RUN['disabled'] else ''}: {_usd(ACCT['spent'])} spent + "
+    inv = _inv_counts()
+    return (f"Auto-buy [{MODE}] bankroll {_usd(tied_cents())}/{_usd(CAPITAL_CENTS)} tied ({inv}) autolist={AUTOLIST_MODE}{' DISABLED' if RUN['disabled'] else ''}: {_usd(ACCT['spent'])} spent + "
             f"{_usd(reserved())} in open orders of {_usd(BUDGET_CENTS)} today{bal} · this run: {RUN['bought']} buys, "
             f"{RUN['ordered']} orders, {RUN['filled']} filled, {RUN['cancelled']} cancelled, {RUN['unknown']} unclear "
             f"· skipped: {skips}")
