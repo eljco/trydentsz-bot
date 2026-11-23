@@ -62,6 +62,14 @@ jobs:
           DISCORD_WEBHOOK_STATUS: ${{ secrets.DISCORD_WEBHOOK_STATUS }}
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
           BUYER_MODE: ${{ secrets.BUYER_MODE }}
+          DISCORD_WEBHOOK_TRADES: ${{ secrets.DISCORD_WEBHOOK_TRADES }}
+          DAILY_BUDGET_EUR: '8'          # was 5
+          CAPITAL_EUR: '116'             # rolling bankroll, money tied up for ~14 days per item
+          BUDGET_TZ: 'Europe/Vilnius'    # daily budget resets at your midnight
+          BUY_MAX_ITEM_USD: '4.00'       # was 3.00 so the 8 EUR budget has more deals to choose from
+          AUTOLIST_MODE: 'notify'        # notify = only posts what it WOULD list; change to live after checking the first one
+          TRADE_LOCK_DAYS: '7'
+          CREDIT_DAYS: '7'               # credit banner appears with <24h left, so ~7 days after the sale
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
           RUN_SECONDS: '1500'
         run: python sniper.py
