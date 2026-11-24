@@ -42,12 +42,21 @@ jobs:
       - name: Install Dependencies
         run: pip install requests brotli
 
+      - name: Set up Node (Steam auto-accept)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Steam libraries
+        run: npm install --no-save steam-session steam-tradeoffer-manager
+
       - name: Restore seen listings & buyer state
         uses: actions/cache/restore@v4
         with:
           path: |
             seen_ids.json
             buyer_state.json
+            steam_accepts.json
           key: state-${{ github.run_id }}
           restore-keys: state-
 
@@ -67,12 +76,27 @@ jobs:
           CAPITAL_EUR: '116'             # rolling bankroll, money tied up for ~14 days per item
           BUDGET_TZ: 'Europe/Vilnius'    # daily budget resets at your midnight
           BUY_MAX_ITEM_USD: '4.00'       # was 3.00 so the 8 EUR budget has more deals to choose from
-          AUTOLIST_MODE: 'live'        # notify = only posts what it WOULD list; change to live after checking the first one
+          AUTOLIST_MODE: 'notify'        # notify = only posts what it WOULD list; change to live after checking the first one
+          BOMBOCLAT_BUDGET_EUR: '5'          # extra daily pool, only for really good deals
+          BOMBOCLAT_MAX_ITEM_EUR: '12'       # a bomboclat deal may cost up to this
+          BOMBOCLAT_MIN_NET_USD: '0.40'      # est. net profit needed for a bomboclat deal ...
+          BOMBOCLAT_MIN_ROI: '0.05'          # ... and at least 5% of the price
+          BUY_MAX_OPEN_ORDERS: '12'      # open buy orders don't count toward the daily budget until they fill
+          LIQ_MIN_SALES: '8'             # was 10 (sales in 3 days)
+          LIQ_MAX_LAST_SALE_HOURS: '12'  # was 8, overnight gaps were blocking everything
           TRADE_LOCK_DAYS: '7'
-          CREDIT_DAYS: '7'               # credit banner appears with <24h left, so ~7 days after the sale
+          CREDIT_DAYS: '7'          # credit banner appears with <24h left, so ~7 days after the sale
           SEND_TEST_ALERT: ${{ github.event.inputs.send_test_alert || 'false' }}
           RUN_SECONDS: '1500'
-        run: python sniper.py
+          STEAM_REFRESH_TOKEN: ${{ secrets.STEAM_REFRESH_TOKEN }}
+          STEAM_ACCEPT_MODE: 'log'       # log = only reports what it WOULD accept; change to 'live' after checking
+        run: |
+          node steam_accept.js &
+          NODE_PID=$!
+          RC=0
+          python sniper.py || RC=$?
+          kill $NODE_PID 2>/dev/null || true
+          exit $RC
 
       - name: Save seen listings & buyer state
         if: always()
@@ -81,4 +105,5 @@ jobs:
           path: |
             seen_ids.json
             buyer_state.json
+            steam_accepts.json
           key: state-${{ github.run_id }}
