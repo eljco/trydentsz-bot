@@ -55,6 +55,17 @@ BUDGET_CENTS = int(DAILY_BUDGET_EUR * EUR_USD_RATE * 100)
 CAPITAL_EUR = _num("CAPITAL_EUR", 116.0)
 CAPITAL_CENTS = int(CAPITAL_EUR * EUR_USD_RATE * 100)
 
+# "bomboclat deal" budget: extra money per day that only an exceptionally good deal may use, on top of the daily budget.
+# A bomboclat deal may use what is left of the daily budget PLUS this pool and may cost up to BOMBOCLAT_MAX_ITEM_EUR.
+BOMBOCLAT_BUDGET_EUR = _num("BOMBOCLAT_BUDGET_EUR", 5.0)
+BOMBOCLAT_BUDGET_CENTS = int(BOMBOCLAT_BUDGET_EUR * EUR_USD_RATE * 100)
+BOMBOCLAT_MAX_ITEM_CENTS = int(_num("BOMBOCLAT_MAX_ITEM_EUR", 12.0) * EUR_USD_RATE * 100)
+BOMBOCLAT_MIN_NET_USD = _num("BOMBOCLAT_MIN_NET_USD", 0.40)   # est. net profit needed ...
+BOMBOCLAT_MIN_ROI = _num("BOMBOCLAT_MIN_ROI", 0.05)           # ... and at least this fraction of the price (stops thin margins on big items)
+# open buy orders do NOT count against the daily budget: the money only counts once an order fills.
+# They still count against the bankroll cap, and this limits how many can be open at the same time.
+MAX_OPEN_ORDERS = int(_num("BUY_MAX_OPEN_ORDERS", 12))
+
 # auto-listing
 AUTOLIST_MODE = os.environ.get("AUTOLIST_MODE", "notify").strip().lower()
 if AUTOLIST_MODE not in ("off", "notify", "live"):
@@ -162,7 +173,8 @@ def reserved():
 
 
 def committed():
-    return int(ACCT["spent"]) + reserved()
+    """What counts against the DAILY budget: money actually spent. Unfilled buy orders are not included."""
+    return int(ACCT["spent"])
 
 
 def _notify(text, color=3447003):
@@ -182,24 +194,24 @@ def _skip(reason):
     return f"\n🤖 not auto-bought: {reason}"
 
 
-def _gate(cents):
-    """None if we may spend `cents` right now, else the reason."""
+def _gate(cents, bomboclat=False, quiet=False):
+    """None if we may spend `cents` right now, else the reason. bomboclat=True uses the bigger limits."""
     if RUN["disabled"]:
         return "auto-buy disabled for this run"
     if time.time() < RUN["pause_until"]:
         return "cooling down after an error"
     if RUN["actions"] >= MAX_ACTIONS_PER_RUN:
         return "per-run action limit"
-    if cents > MAX_ITEM_CENTS:
-        return f"above max item price {_usd(MAX_ITEM_CENTS)}"
+    if cents > (BOMBOCLAT_MAX_ITEM_CENTS if bomboclat else MAX_ITEM_CENTS):
+        return f"above max item price {_usd(BOMBOCLAT_MAX_ITEM_CENTS if bomboclat else MAX_ITEM_CENTS)}"
     if tied_cents() + reserved() + cents > CAPITAL_CENTS:
         return "bankroll tied up (waiting for sales / credits)"
-    if committed() + cents > BUDGET_CENTS:
-        if ACCT.get("bn") != ACCT["day"]:
+    if committed() + cents > BUDGET_CENTS + (BOMBOCLAT_BUDGET_CENTS if bomboclat else 0):
+        if not quiet and ACCT.get("bn") != ACCT["day"]:
             ACCT["bn"] = ACCT["day"]
             save()
             _notify(f"⛔ **Daily budget reached** [{MODE}]: {_usd(committed())} of {_usd(BUDGET_CENTS)} "
-                    f"is spent or tied up in open orders. Auto-buy pauses until the day rolls over ({BUDGET_TZ}).",
+                    f"has been spent (open buy orders only count once they fill). Auto-buy pauses until the day rolls over ({BUDGET_TZ}).",
                     16766720)
         return "daily budget"
     return None
@@ -355,7 +367,7 @@ def _on_deal(listing, hit):
         return _skip("stickers or souvenir")
     if lid in ACCT["bought"]:
         return _skip("already bought this listing")
-    gate = _gate(cents)
+    gate = _gate(cents, bomboclat=True, quiet=True)      # loosest limits first; the real limit is decided once the profit is known
     if gate:
         return _skip(gate)
 
@@ -375,10 +387,15 @@ def _on_deal(listing, hit):
     net, basis = _net(price, est[3], s["median"])
     if net < MIN_PROFIT_USD:
         return _skip(f"net {net:+.2f} below minimum {MIN_PROFIT_USD:.2f}")
-    return _buy_now(lid, name, cents, net, basis, n, last_h, item)
+    bomboclat = net >= BOMBOCLAT_MIN_NET_USD and net >= BOMBOCLAT_MIN_ROI * price
+    gate = _gate(cents, bomboclat=bomboclat)
+    if gate:
+        extra = "" if bomboclat else f" (net {net:+.2f}, a bomboclat deal needs +{BOMBOCLAT_MIN_NET_USD:.2f} and {BOMBOCLAT_MIN_ROI:.0%})"
+        return _skip(gate + extra)
+    return _buy_now(lid, name, cents, net, basis, n, last_h, item, (listing.get("seller") or {}).get("steam_id"), bomboclat)
 
 
-def _buy_now(lid, name, cents, net, basis, n, last_h, item=None):
+def _buy_now(lid, name, cents, net, basis, n, last_h, item=None, seller=None, bomboclat=False):
     RUN["actions"] += 1
     ACCT["spent"] += cents                 # reserve first: if anything below goes wrong the money still counts
     ACCT["bought"][lid] = time.time()
@@ -386,16 +403,19 @@ def _buy_now(lid, name, cents, net, basis, n, last_h, item=None):
     link = f"https://csfloat.com/item/{lid}"
     detail = (f"{name} for **{_usd(cents)}** · est. net **+${net:.2f}** (resale basis {_usd(int(basis * 100))}) · "
               f"{_liq_text(n, last_h)}\n[open listing]({link})")
-    left = f"Budget: {_usd(committed())} / {_usd(BUDGET_CENTS)} committed today"
+    left = f"Budget: {_usd(committed())} / {_usd(BUDGET_CENTS)} spent today"
+    if bomboclat:
+        left += f" (💣 bomboclat pool allowed up to +{_usd(BOMBOCLAT_BUDGET_CENTS)})"
+    tag = "💣 BOMBOCLAT DEAL " if bomboclat else ""
     if not LIVE:
         RUN["bought"] += 1
-        _notify(f"🧪 **DRY RUN, would buy** {detail}\n{left}", 10070709)
+        _notify(f"🧪 **DRY RUN, would buy** {tag}{detail}\n{left}", 10070709)
         return "\n🤖 DRY RUN: would have bought this"
     outcome, status, data = _call("POST", "/listings/buy", {"contract_ids": [lid], "total_price": cents})
     if outcome == "ok":
         RUN["bought"] += 1
-        _inv_add(lid, name, cents, (item or {}).get("float_value"))
-        _notify(f"🛒 **BOUGHT** {detail}\n{left}\nTrade lock ends ~{_fmt_ts(time.time() + LOCK_DAYS * 86400)} "
+        _inv_add(lid, name, cents, (item or {}).get("float_value"), seller)
+        _notify(f"🛒 **{tag}BOUGHT** {detail}\n{left}\nTrade lock ends ~{_fmt_ts(time.time() + LOCK_DAYS * 86400)} "
                 f"(accept the seller's Steam trade offer!)", 5763719)
         return "\n🤖 AUTO-BOUGHT"
     if outcome == "rejected":
@@ -433,6 +453,9 @@ def _on_gap(name, ask, base, top):
     if gate:
         _skip(gate)
         return
+    if len(ACCT["orders"]) >= MAX_OPEN_ORDERS:
+        _skip("max open buy orders")
+        return
     sales = M.get_sales(name, budgeted=False)
     if sales is None:
         _skip("no sales data")
@@ -460,7 +483,7 @@ def _place_order(name, cents, net, basis, n, last_h, top, ask):
     save()
     detail = (f"{name}: bid **{_usd(cents)}** (top bid {_usd(int(round(top * 100)))}, lowest listing "
               f"{_usd(int(round(ask * 100)))}) · est. net **+${net:.2f}** · {_liq_text(n, last_h)}")
-    left = f"Budget: {_usd(committed())} / {_usd(BUDGET_CENTS)} committed today"
+    left = f"Budget: {_usd(committed())} / {_usd(BUDGET_CENTS)} spent today"
     if not LIVE:
         RUN["ordered"] += 1
         _notify(f"🧪 **DRY RUN, would place buy order** {detail}\n{left}", 10070709)
@@ -497,6 +520,7 @@ def maintain(force=False):
             _check_balance()
             _reconcile()
         _expire_orders()
+        _trim_orders()
         if LIVE and AUTOLIST_MODE != "off":
             _inventory_cycle()
         save()
@@ -586,6 +610,28 @@ def _expire_orders():
 
 
 
+def _trim_orders():
+    """Orders do not reserve daily budget, so once the day's spending leaves no room for an order, cancel it
+    (otherwise it could still fill and push the day over budget)."""
+    for oid, o in list(ACCT["orders"].items()):
+        if oid.startswith("pending-") or committed() + int(o["cents"]) <= BUDGET_CENTS:
+            continue
+        if not LIVE or oid.startswith("dry-"):
+            ACCT["orders"].pop(oid, None)
+            RUN["cancelled"] += 1
+            continue
+        outcome, status, data = _call("DELETE", f"/buy-orders/{oid}")
+        if outcome == "ok":
+            ACCT["orders"].pop(oid, None)
+            RUN["cancelled"] += 1
+            M.log(f"buyer: cancelled buy order {o['name']} (no daily budget left for it)")
+        elif status == 404:                       # already gone: most likely filled
+            ACCT["orders"].pop(oid, None)
+            ACCT["spent"] += int(o["cents"])
+        else:
+            M.log(f"buyer: could not cancel {oid} ({outcome} {status}), will retry")
+
+
 # ================= INVENTORY LEDGER / AUTO-LIST / SALES =================
 # statuses: bought (waiting for the trade lock / listing) -> listed -> sold (waiting for the money) -> credited
 ACTIVE_INV = ("bought", "listed", "sold")
@@ -608,11 +654,11 @@ def _fmt_ts(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%d %b %H:%M UTC")
 
 
-def _inv_add(key, name, cents, flt):
+def _inv_add(key, name, cents, flt, seller=None):
     if not LIVE:
         return
     _inv()[str(key)] = {"name": name, "cost": int(cents), "float": flt, "bought": time.time(),
-                        "status": "bought", "retry": 0, "fails": 0}
+                        "status": "bought", "retry": 0, "fails": 0, "seller": str(seller) if seller else None}
     save()
 
 
@@ -660,14 +706,31 @@ def _net_cents(price_cents, cost):
     return int(price_cents * (1 - M.SELL_FEE)) - int(cost)
 
 
+ACCEPTS_FILE = os.environ.get("STEAM_ACCEPTS_FILE", "steam_accepts.json")
+
+
+def _read_accepts():
+    """steam_accept.js records when it accepted the seller's offer: the 7-day lock starts then, not at purchase."""
+    try:
+        with open(ACCEPTS_FILE) as f:
+            acc = json.load(f)
+    except Exception:
+        return
+    for k, a in (acc or {}).items():
+        v = _inv().get(k)
+        if v and isinstance(a, dict) and not v.get("accepted_ts") and a.get("ts"):
+            v["accepted_ts"] = float(a["ts"])
+
+
 def _inventory_cycle():
     now = time.time()
     inv = _inv()
     for k, v in list(inv.items()):                  # forget finished items after 30 days
         if v.get("status") == "credited" and now - v.get("credited_ts", now) > 30 * 86400:
             inv.pop(k, None)
+    _read_accepts()
     due_list = [k for k, v in inv.items() if v.get("status") == "bought"
-                and now >= v["bought"] + LOCK_DAYS * 86400 and now >= v.get("retry", 0)]
+                and now >= (v.get("accepted_ts") or v["bought"]) + LOCK_DAYS * 86400 and now >= v.get("retry", 0)]
     listed = [k for k, v in inv.items() if v.get("status") == "listed"]
     sold = [k for k, v in inv.items() if v.get("status") == "sold"]
 
@@ -854,6 +917,6 @@ def status_line():
     bal = f" · balance {_usd(RUN['balance'])}" if RUN["balance"] is not None else ""
     inv = _inv_counts()
     return (f"Auto-buy [{MODE}] bankroll {_usd(tied_cents())}/{_usd(CAPITAL_CENTS)} tied ({inv}) autolist={AUTOLIST_MODE}{' DISABLED' if RUN['disabled'] else ''}: {_usd(ACCT['spent'])} spent + "
-            f"{_usd(reserved())} in open orders of {_usd(BUDGET_CENTS)} today{bal} · this run: {RUN['bought']} buys, "
+            f"{_usd(reserved())} in open orders (not counted until filled) of {_usd(BUDGET_CENTS)} today{bal} · this run: {RUN['bought']} buys, "
             f"{RUN['ordered']} orders, {RUN['filled']} filled, {RUN['cancelled']} cancelled, {RUN['unknown']} unclear "
             f"· skipped: {skips}")
