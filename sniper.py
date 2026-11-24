@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 import requests
 import buyer
+import trends
 
 # ================= CONFIG =================
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
@@ -150,7 +151,7 @@ ENABLE_BUYORDERS = True
 BO_EVERY = int(os.environ.get("BO_EVERY", "4"))
 BO_MAX_PRICE_USD = 57.5
 BO_MIN_PRICE_USD = 1.0
-BO_MAX_ITEMS = 40
+BO_MAX_ITEMS = int(os.environ.get("BO_MAX_ITEMS", "40"))
 BO_MIN_SKINPORT_QTY = 20
 BO_PRIORITY = ["ak-47 | inheritance", "awp | ice coaled", "m4a1-s | black lotus", "ak-47 | elite build",
                "ak-47 | crane flight"]
@@ -1329,6 +1330,10 @@ def poll_once():
     if listings is None:
         return (not is_err), override
     learn_stickers(listings)
+    try:
+        trends.observe(listings)          # market index data (see trends.py)
+    except Exception as e:
+        log("trends observe error:", repr(e))
     all_listings = {l["id"]: l for l in listings if l.get("id")}
 
     now = time.time()
@@ -1469,6 +1474,7 @@ def main():
             refresh_sources()
             ok, override = poll_once()
             buyer.maintain()  # Wired buyer maintenance check
+            trends.maybe_post()
         except Exception as e:
             log("Unexpected error:", repr(e))
             ok, override = False, 20
